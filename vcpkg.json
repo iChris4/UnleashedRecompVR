@@ -10,7 +10,11 @@
             "platform": "windows"
         },
         "freetype",
-        "curl"
+        "curl",
+        {
+            "name": "openxr-loader",
+            "platform": "windows"
+        }
     ],
     "vcpkg-configuration": {
         "overlay-triplets": [

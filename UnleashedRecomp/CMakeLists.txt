@@ -2,6 +2,11 @@ project("UnleashedRecomp")
 
 if (WIN32)
     option(UNLEASHED_RECOMP_D3D12 "Add D3D12 support for rendering" ON)
+    option(UNLEASHED_RECOMP_OPENXR "Add OpenXR (VR) support, D3D12 only for now" ON)
+endif()
+
+if (UNLEASHED_RECOMP_OPENXR AND NOT UNLEASHED_RECOMP_D3D12)
+    message(FATAL_ERROR "UNLEASHED_RECOMP_OPENXR currently requires UNLEASHED_RECOMP_D3D12.")
 endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -192,6 +197,19 @@ set(UNLEASHED_RECOMP_MOD_CXX_SOURCES
     "mod/mod_loader.cpp"
 )
 
+if (UNLEASHED_RECOMP_OPENXR)
+    set(UNLEASHED_RECOMP_XR_CXX_SOURCES
+        "xr/xr.cpp"
+        "xr/xr_d3d12.cpp"
+        "xr/core/openxr_runtime.cpp"
+    )
+
+    # Vendored from PrimedGun unchanged; it has its own includes and feature guard.
+    set_source_files_properties("xr/core/openxr_runtime.cpp" PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON
+        COMPILE_DEFINITIONS MP_ENABLE_OPENXR)
+endif()
+
 set(UNLEASHED_RECOMP_THIRDPARTY_SOURCES
     "${UNLEASHED_RECOMP_THIRDPARTY_ROOT}/imgui/backends/imgui_impl_sdl2.cpp"
     "${UNLEASHED_RECOMP_THIRDPARTY_ROOT}/imgui/imgui.cpp"
@@ -242,6 +260,7 @@ set(UNLEASHED_RECOMP_CXX_SOURCES
     ${UNLEASHED_RECOMP_INSTALL_CXX_SOURCES}
     ${UNLEASHED_RECOMP_USER_CXX_SOURCES}
     ${UNLEASHED_RECOMP_MOD_CXX_SOURCES}
+    ${UNLEASHED_RECOMP_XR_CXX_SOURCES}
     ${UNLEASHED_RECOMP_THIRDPARTY_SOURCES}
 )
 
@@ -375,6 +394,19 @@ if (UNLEASHED_RECOMP_D3D12)
     )
 endif()
 
+if (UNLEASHED_RECOMP_OPENXR)
+    find_package(OpenXR CONFIG REQUIRED)
+    target_compile_definitions(UnleashedRecomp PRIVATE UNLEASHED_RECOMP_OPENXR)
+    target_include_directories(UnleashedRecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/xr/core")
+
+    # xr_d3d12.cpp includes plume's D3D12 backend, which uses the Agility SDK headers.
+    target_link_libraries(UnleashedRecomp PRIVATE
+        OpenXR::openxr_loader
+        OpenXR::headers
+        Microsoft::DirectX-Headers
+    )
+endif()
+
 if (WIN32)
     target_link_libraries(UnleashedRecomp PRIVATE
         comctl32
@@ -467,6 +499,7 @@ compile_pixel_shader(resolve_msaa_color_8x)
 compile_pixel_shader(resolve_msaa_depth_2x)
 compile_pixel_shader(resolve_msaa_depth_4x)
 compile_pixel_shader(resolve_msaa_depth_8x)
+compile_pixel_shader(xr_blit_ps)
 
 set(RESOURCES_SOURCE_PATH "${PROJECT_SOURCE_DIR}/../UnleashedRecompResources")
 set(RESOURCES_OUTPUT_PATH "${PROJECT_SOURCE_DIR}/res")

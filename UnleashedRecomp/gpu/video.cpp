@@ -31,7 +31,9 @@
 #include <user/config.h>
 #include <sdl_listener.h>
 #include <xxHashMap.h>
+#include <os/logger.h>
 #include <os/process.h>
+#include <xr/xr.h>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
 #include <magic_enum/magic_enum.hpp>
@@ -64,6 +66,7 @@
 #include "shader/resolve_msaa_depth_2x.hlsl.dxil.h"
 #include "shader/resolve_msaa_depth_4x.hlsl.dxil.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.dxil.h"
+#include "shader/xr_blit_ps.hlsl.dxil.h"
 #endif
 
 #include "shader/blend_color_alpha_ps.hlsl.spirv.h"
@@ -89,6 +92,7 @@
 #include "shader/resolve_msaa_depth_2x.hlsl.spirv.h"
 #include "shader/resolve_msaa_depth_4x.hlsl.spirv.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.spirv.h"
+#include "shader/xr_blit_ps.hlsl.spirv.h"
 
 #ifdef _WIN32
 extern "C"
@@ -333,6 +337,20 @@ static uint32_t g_intermediaryBackBufferTextureHeight;
 static uint32_t g_intermediaryBackBufferTextureDescriptorIndex;
 
 static std::unique_ptr<RenderPipeline> g_gammaCorrectionPipeline;
+
+// VR: the gamma-corrected screen picture, in the format the OpenXR swapchain can
+// be copied from. Copied into the headset's image and scaled into the window.
+static std::unique_ptr<RenderTexture> g_vrScreenTexture;
+static std::unique_ptr<RenderFramebuffer> g_vrScreenFramebuffer;
+static uint32_t g_vrScreenTextureWidth;
+static uint32_t g_vrScreenTextureHeight;
+static uint32_t g_vrScreenTextureDescriptorIndex;
+static std::unique_ptr<RenderPipeline> g_vrGammaCorrectionPipeline;
+static std::unique_ptr<RenderPipeline> g_vrMirrorPipeline;
+
+// The headset image acquired for the frame being presented. Written by the
+// presenting thread before it enqueues ExecuteCommandList, read by the render thread.
+static RenderTexture* g_vrScreenTarget;
 
 struct std::unique_ptr<RenderDescriptorSet> g_textureDescriptorSet;
 struct std::unique_ptr<RenderDescriptorSet> g_samplerDescriptorSet;
@@ -1529,7 +1547,8 @@ static void CreateImGuiBackend()
 
 static void CheckSwapChain()
 {
-    g_swapChain->setVsyncEnabled(Config::VSync);
+    // In VR the headset paces the game; the window is only a mirror and must never block on vsync.
+    g_swapChain->setVsyncEnabled(Config::VSync && !VR::IsActive());
     g_swapChainValid &= !g_swapChain->needsResize();
 
     if (!g_swapChainValid)
@@ -1537,7 +1556,9 @@ static void CheckSwapChain()
         Video::WaitForGPU();
         g_backBuffer->framebuffers.clear();
         g_swapChainValid = g_swapChain->resize();
-        g_needsResize = g_swapChainValid;
+
+        // In VR the game's resolution does not follow the window.
+        g_needsResize = g_swapChainValid && !VR::IsActive();
     }
 
     if (g_swapChainValid)
@@ -1563,12 +1584,14 @@ static void BeginCommandList()
     g_pipelineState.renderTargetFormat = BACKBUFFER_FORMAT;
     g_pipelineState.depthStencilFormat = RenderFormat::UNKNOWN;
 
-    if (g_swapChainValid)
+    // In VR the game always renders into the intermediary texture, which is then
+    // copied to the headset, also while the window is minimised.
+    if (g_swapChainValid || VR::IsActive())
     {
         uint32_t width = Video::s_viewportWidth;
         uint32_t height = Video::s_viewportHeight;
 
-        bool usingIntermediaryTexture = (width != g_swapChain->getWidth()) || (height != g_swapChain->getHeight()) ||
+        bool usingIntermediaryTexture = VR::IsActive() || (width != g_swapChain->getWidth()) || (height != g_swapChain->getHeight()) ||
             Config::XboxColorCorrection || (abs(Config::Brightness - 0.5f) > 0.001f);
 
         if (usingIntermediaryTexture)
@@ -1595,6 +1618,27 @@ static void BeginCommandList()
         else
         {
             g_backBuffer->texture = g_swapChain->getTexture(g_backBufferIndex);
+        }
+
+        if (VR::IsActive() && (g_vrScreenTextureWidth != width || g_vrScreenTextureHeight != height))
+        {
+            if (g_vrScreenTextureDescriptorIndex == NULL)
+                g_vrScreenTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
+
+            Video::WaitForGPU(); // Only when the screen resolution changes.
+
+            g_vrScreenFramebuffer.reset();
+            g_vrScreenTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, VR::GetScreenFormat(), RenderTextureFlag::RENDER_TARGET));
+            g_textureDescriptorSet->setTexture(g_vrScreenTextureDescriptorIndex, g_vrScreenTexture.get(), RenderTextureLayout::SHADER_READ);
+
+            RenderFramebufferDesc framebufferDesc;
+            const RenderTexture* colorAttachment = g_vrScreenTexture.get();
+            framebufferDesc.colorAttachments = &colorAttachment;
+            framebufferDesc.colorAttachmentsCount = 1;
+            g_vrScreenFramebuffer = g_device->createFramebuffer(framebufferDesc);
+
+            g_vrScreenTextureWidth = width;
+            g_vrScreenTextureHeight = height;
         }
     }
     else
@@ -1671,8 +1715,16 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     GameWindow::Init(sdlVideoDriver);
 
+    // OpenXR must find the headset before the device exists: the runtime decides the adapter.
+    // VR currently requires D3D12, so a retry after a D3D12 crash stays flat.
+    std::string vrAdapterName;
 #ifdef UNLEASHED_RECOMP_D3D12
-    g_vulkan = DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan;
+    if (VR::s_requested && !graphicsApiRetry && VR::Init())
+        vrAdapterName = VR::GetAdapterName();
+#endif
+
+#ifdef UNLEASHED_RECOMP_D3D12
+    g_vulkan = !VR::IsInitialized() && (DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan);
 #endif
 
     // Attempt to create the possible backends using a vector of function pointers. Whichever succeeds first will be the chosen API.
@@ -1680,7 +1732,8 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     std::vector<RenderInterfaceFunction *> interfaceFunctions;
 
 #ifdef UNLEASHED_RECOMP_D3D12
-    bool allowVulkanRedirection = true;
+    // Never silently move a VR session to Vulkan.
+    bool allowVulkanRedirection = !VR::IsInitialized();
 
     if (graphicsApiRetry)
     {
@@ -1713,7 +1766,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
                 continue;
             }
 
-            g_device = g_interface->createDevice(Config::GraphicsDevice);
+            bool useVRAdapter = false;
+#ifdef UNLEASHED_RECOMP_D3D12
+            useVRAdapter = (interfaceFunction == CreateD3D12Interface) && !vrAdapterName.empty();
+#endif
+            g_device = g_interface->createDevice(useVRAdapter ? vrAdapterName : Config::GraphicsDevice.Value);
             if (g_device != nullptr)
             {
                 const RenderDeviceDescription &deviceDescription = g_device->getDescription();
@@ -1793,7 +1850,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     if (g_device == nullptr)
     {
+        VR::Shutdown();
         return false;
+    }
+
+    if (VR::IsInitialized() && g_vulkan)
+    {
+        LOGN_WARNING("[VR] D3D12 could not be used; VR requires it for now. The game will run without VR.");
+        VR::Shutdown();
     }
 
 #ifdef UNLEASHED_RECOMP_D3D12
@@ -1849,6 +1913,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     g_copyQueue = g_device->createCommandQueue(RenderCommandListType::COPY);
     g_copyCommandList = g_copyQueue->createCommandList();
     g_copyCommandFence = g_device->createCommandFence();
+
+    // The session uses the direct queue, so the runtime orders its reads of the
+    // headset images after the render thread's copies into them.
+    if (VR::IsInitialized() && !VR::CreateSession(g_device.get(), g_queue.get()))
+    {
+        LOGN_WARNING("[VR] The OpenXR session could not be created. The game will run without VR.");
+        VR::Shutdown();
+    }
 
     uint32_t bufferCount = 2;
 
@@ -2046,6 +2118,26 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
     desc.renderTargetCount = 1;
     g_gammaCorrectionPipeline = g_device->createGraphicsPipeline(desc);
+
+    if (VR::IsActive())
+    {
+        if (VR::GetScreenFormat() != BACKBUFFER_FORMAT)
+        {
+            desc.renderTargetFormat[0] = VR::GetScreenFormat();
+            g_vrGammaCorrectionPipeline = g_device->createGraphicsPipeline(desc);
+        }
+
+        auto mirrorShader = CREATE_SHADER(xr_blit_ps);
+
+        desc = {};
+        desc.pipelineLayout = g_pipelineLayout.get();
+        desc.vertexShader = g_copyShader.get();
+        desc.pixelShader = mirrorShader.get();
+        desc.renderTargetFormat[0] = BACKBUFFER_FORMAT;
+        desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+        desc.renderTargetCount = 1;
+        g_vrMirrorPipeline = g_device->createGraphicsPipeline(desc);
+    }
 
     // NOTE: We initially allocate this on host memory to make the installer work, even if the 4 GB memory allocation fails.
     g_backBufferHolder = std::make_unique<GuestSurface>(ResourceType::RenderTarget);
@@ -2774,7 +2866,14 @@ void Video::WaitOnSwapChain()
 {
     if (g_pendingWaitOnSwapChain)
     {
-        if (g_swapChainValid)
+        if (VR::IsActive())
+        {
+            // xrWaitFrame paces the game; the poses located here belong to this frame.
+            g_presentWaitProfiler.Begin();
+            VR::BeginFrame();
+            g_presentWaitProfiler.End();
+        }
+        else if (g_swapChainValid)
         {
             g_presentWaitProfiler.Begin();
             g_swapChain->wait();
@@ -2798,6 +2897,14 @@ void Video::Present()
 
     DrawImGui();
 
+    if (VR::IsActive())
+    {
+        // Frames presented without CApplication::Update (the installer, or the
+        // main thread after the loading thread presented) begin their XR frame here.
+        VR::BeginFrame();
+        g_vrScreenTarget = VR::AcquireScreenImage();
+    }
+
     cmd.type = RenderCommandType::ExecuteCommandList;
     g_renderQueue.enqueue(cmd);
 
@@ -2811,9 +2918,17 @@ void Video::Present()
     g_executedCommandList.wait(false);
     g_executedCommandList = false;
 
+    // The copy into the headset image has been submitted; hand it to the compositor.
+    bool pacedByVR = false;
+    if (VR::IsActive())
+    {
+        pacedByVR = VR::EndFrame();
+        g_vrScreenTarget = nullptr;
+    }
+
     if (g_swapChainValid)
     {
-        if (g_pendingWaitOnSwapChain)
+        if (g_pendingWaitOnSwapChain && !VR::IsActive())
         {
             g_presentWaitProfiler.Begin();
             g_swapChain->wait(); // Never gonna happen outside loading threads as explained above.
@@ -2853,7 +2968,8 @@ void Video::Present()
     cmd.type = RenderCommandType::BeginCommandList;
     g_renderQueue.enqueue(cmd);
 
-    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
+    // While the headset paces the frames, the desktop limiter would only add latency.
+    if (!pacedByVR && Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
     {
         using namespace std::chrono_literals;
 
@@ -2894,44 +3010,151 @@ static void SetRootDescriptor(const UploadAllocation& allocation, size_t index)
         commandList->setGraphicsRootDescriptor(allocation.buffer->at(allocation.offset), index);
 }
 
+struct GammaCorrectionConstants
+{
+    float gammaR;
+    float gammaG;
+    float gammaB;
+    uint32_t textureDescriptorIndex;
+
+    int32_t viewportOffsetX;
+    int32_t viewportOffsetY;
+    int32_t viewportWidth;
+    int32_t viewportHeight;
+};
+
+static void ComputeGammaCorrection(GammaCorrectionConstants& constants)
+{
+    if (Config::XboxColorCorrection)
+    {
+        constants.gammaR = 1.2f;
+        constants.gammaG = 1.17f;
+        constants.gammaB = 0.98f;
+    }
+    else
+    {
+        constants.gammaR = 1.0f;
+        constants.gammaG = 1.0f;
+        constants.gammaB = 1.0f;
+    }
+
+    float offset = (Config::Brightness - 0.5f) * 1.2f;
+
+    constants.gammaR = 1.0f / std::clamp(constants.gammaR + offset, 0.1f, 4.0f);
+    constants.gammaG = 1.0f / std::clamp(constants.gammaG + offset, 0.1f, 4.0f);
+    constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
+}
+
+// VR: gamma-correct the game's picture into the screen texture, copy it into
+// the headset's image, and scale it into the window.
+static void ExecuteVRScreenPasses()
+{
+    auto& commandList = g_commandLists[g_frame];
+
+    GammaCorrectionConstants constants;
+    ComputeGammaCorrection(constants);
+    constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
+    constants.viewportOffsetX = 0;
+    constants.viewportOffsetY = 0;
+    constants.viewportWidth = g_vrScreenTextureWidth;
+    constants.viewportHeight = g_vrScreenTextureHeight;
+
+    RenderTextureBarrier gammaBarriers[] =
+    {
+        RenderTextureBarrier(g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ),
+        RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::COLOR_WRITE)
+    };
+
+    commandList->barriers(RenderBarrierStage::GRAPHICS, gammaBarriers, std::size(gammaBarriers));
+    commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    commandList->setPipeline(g_vrGammaCorrectionPipeline != nullptr ? g_vrGammaCorrectionPipeline.get() : g_gammaCorrectionPipeline.get());
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&constants, sizeof(constants), 0x100), 2);
+    commandList->setFramebuffer(g_vrScreenFramebuffer.get());
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_vrScreenTextureWidth), float(g_vrScreenTextureHeight)));
+    commandList->setScissors(RenderRect(0, 0, g_vrScreenTextureWidth, g_vrScreenTextureHeight));
+    commandList->drawInstanced(6, 1, 0, 0);
+
+    if (g_vrScreenTarget != nullptr)
+    {
+        // The swapchain image is the sRGB sibling of the screen texture's format,
+        // so the compositor decodes the gamma-encoded bytes as such.
+        RenderTextureBarrier copyBarriers[] =
+        {
+            RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::COPY_SOURCE),
+            RenderTextureBarrier(g_vrScreenTarget, RenderTextureLayout::COPY_DEST)
+        };
+
+        commandList->barriers(RenderBarrierStage::COPY, copyBarriers, std::size(copyBarriers));
+        commandList->copyTexture(g_vrScreenTarget, g_vrScreenTexture.get());
+
+        // OpenXR requires the image back in the render target state on release.
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g_vrScreenTarget, RenderTextureLayout::COLOR_WRITE));
+    }
+
+    if (!g_swapChainValid)
+        return;
+
+    auto swapChainTexture = g_swapChain->getTexture(g_backBufferIndex);
+    uint32_t windowWidth = g_swapChain->getWidth();
+    uint32_t windowHeight = g_swapChain->getHeight();
+
+    struct
+    {
+        uint32_t textureDescriptorIndex;
+        uint32_t padding[3];
+        float destinationRect[4];
+    } mirrorConstants = {};
+
+    // Fit the screen into the window, keeping its aspect ratio.
+    float scale = std::min(float(windowWidth) / float(g_vrScreenTextureWidth), float(windowHeight) / float(g_vrScreenTextureHeight));
+    float mirrorWidth = float(g_vrScreenTextureWidth) * scale;
+    float mirrorHeight = float(g_vrScreenTextureHeight) * scale;
+    mirrorConstants.textureDescriptorIndex = g_vrScreenTextureDescriptorIndex;
+    mirrorConstants.destinationRect[0] = (float(windowWidth) - mirrorWidth) * 0.5f;
+    mirrorConstants.destinationRect[1] = (float(windowHeight) - mirrorHeight) * 0.5f;
+    mirrorConstants.destinationRect[2] = mirrorWidth;
+    mirrorConstants.destinationRect[3] = mirrorHeight;
+
+    auto& framebuffer = g_backBuffer->framebuffers[swapChainTexture];
+    if (!framebuffer)
+    {
+        RenderFramebufferDesc desc;
+        desc.colorAttachments = const_cast<const RenderTexture**>(&swapChainTexture);
+        desc.colorAttachmentsCount = 1;
+        framebuffer = g_device->createFramebuffer(desc);
+    }
+
+    RenderTextureBarrier mirrorBarriers[] =
+    {
+        RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::SHADER_READ),
+        RenderTextureBarrier(swapChainTexture, RenderTextureLayout::COLOR_WRITE)
+    };
+
+    commandList->barriers(RenderBarrierStage::GRAPHICS, mirrorBarriers, std::size(mirrorBarriers));
+    commandList->setPipeline(g_vrMirrorPipeline.get());
+    SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&mirrorConstants, sizeof(mirrorConstants), 0x100), 2);
+    commandList->setFramebuffer(framebuffer.get());
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(windowWidth), float(windowHeight)));
+    commandList->setScissors(RenderRect(0, 0, windowWidth, windowHeight));
+    commandList->drawInstanced(6, 1, 0, 0);
+    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
+}
+
 static void ProcExecuteCommandList(const RenderCommand& cmd)
-{    
-    if (g_swapChainValid)
+{
+    if (VR::IsActive() && g_vrScreenTexture != nullptr && g_backBuffer->texture == g_intermediaryBackBufferTexture.get())
+    {
+        ExecuteVRScreenPasses();
+    }
+    else if (g_swapChainValid)
     {
         auto swapChainTexture = g_swapChain->getTexture(g_backBufferIndex);
         if (g_backBuffer->texture == g_intermediaryBackBufferTexture.get())
         {
-            struct
-            {
-                float gammaR;
-                float gammaG;
-                float gammaB;
-                uint32_t textureDescriptorIndex;
-
-                int32_t viewportOffsetX;
-                int32_t viewportOffsetY;
-                int32_t viewportWidth;
-                int32_t viewportHeight;
-            } constants;
-
-            if (Config::XboxColorCorrection)
-            {
-                constants.gammaR = 1.2f;
-                constants.gammaG = 1.17f;
-                constants.gammaB = 0.98f;
-            }
-            else
-            {
-                constants.gammaR = 1.0f;
-                constants.gammaG = 1.0f;
-                constants.gammaB = 1.0f;
-            }
-
-            float offset = (Config::Brightness - 0.5f) * 1.2f;
-
-            constants.gammaR = 1.0f / std::clamp(constants.gammaR + offset, 0.1f, 4.0f);
-            constants.gammaG = 1.0f / std::clamp(constants.gammaG + offset, 0.1f, 4.0f);
-            constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
+            GammaCorrectionConstants constants;
+            ComputeGammaCorrection(constants);
             constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
 
             constants.viewportOffsetX = (int32_t(g_swapChain->getWidth()) - int32_t(Video::s_viewportWidth)) / 2;
@@ -3014,6 +3237,15 @@ static GuestSurface* GetBackBuffer()
 
 void Video::ComputeViewportDimensions()
 {
+    if (VR::IsActive())
+    {
+        // The headset's screen is 16:9 at its own resolution; the window only mirrors it.
+        s_viewportWidth = VR::GetScreenWidth();
+        s_viewportHeight = VR::GetScreenHeight();
+        AspectRatioPatches::ComputeOffsets();
+        return;
+    }
+
     uint32_t width = g_swapChain->getWidth();
     uint32_t height = g_swapChain->getHeight();
     float aspectRatio = float(width) / float(height);

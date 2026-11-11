@@ -27,6 +27,7 @@
 #include <ui/installer_wizard.h>
 #include <mod/mod_loader.h>
 #include <preload_executable.h>
+#include <xr/xr.h>
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -213,6 +214,7 @@ int main(int argc, char *argv[])
     bool useDefaultWorkingDirectory = false;
     bool forceInstallationCheck = false;
     bool graphicsApiRetry = false;
+    bool enableVR = false;
     const char *sdlVideoDriver = nullptr;
 
     for (uint32_t i = 1; i < argc; i++)
@@ -222,6 +224,7 @@ int main(int argc, char *argv[])
         useDefaultWorkingDirectory = useDefaultWorkingDirectory || (strcmp(argv[i], "--use-cwd") == 0);
         forceInstallationCheck = forceInstallationCheck || (strcmp(argv[i], "--install-check") == 0);
         graphicsApiRetry = graphicsApiRetry || (strcmp(argv[i], "--graphics-api-retry") == 0);
+        enableVR = enableVR || (strcmp(argv[i], "--vr") == 0);
 
         if (strcmp(argv[i], "--sdl-video-driver") == 0)
         {
@@ -240,6 +243,8 @@ int main(int argc, char *argv[])
     }
 
     Config::Load();
+
+    VR::s_requested = enableVR || Config::VREnabled;
 
     if (forceInstallationCheck)
     {
