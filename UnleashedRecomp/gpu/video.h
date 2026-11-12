@@ -15,6 +15,12 @@ using namespace plume;
 
 struct Video
 {
+    // VR: the game camera as last drawn, for the guest's culling and HUD markers:
+    // its lens (the frustum scales of its projection, without the culling
+    // rotation) and the horizon lock (a row-vector rotation of its view space, 16
+    // floats). False before a stereo frame was drawn recently.
+    static bool GetVRCameraState(float& lensX, float& lensY, float horizonLock[16]);
+
     static inline uint32_t s_viewportWidth;
     static inline uint32_t s_viewportHeight;
 
@@ -314,6 +320,9 @@ struct GuestShader : GuestResource
 
     // VR: the light shaft pass, which blurs towards the sun's position on screen.
     bool vrLightShaftShader = false;
+
+    // VR: a depth of field pass, which blends towards blurred copies.
+    bool vrDepthOfFieldShader = false;
 
     // VR: the shader's hash, for the VR log.
     uint64_t vrHash = 0;

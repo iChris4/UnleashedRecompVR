@@ -28,6 +28,7 @@
 #include <ui/game_window.h>
 #include <ui/black_bar.h>
 #include <patches/aspect_ratio_patches.h>
+#include <patches/inspire_patches.h>
 #include <user/config.h>
 #include <sdl_listener.h>
 #include <xxHashMap.h>
@@ -1105,6 +1106,8 @@ static VRStateSnapshot g_vrSnapshot;
 struct VREyeState
 {
     float projectionTerms[4];
+
+    // The game camera's view space to the eye's, through the horizon lock.
     XrMatrix eyeFromView;
 
     // The HUD canvas (normalised device coordinates) on a panel in front of the
@@ -1132,6 +1135,9 @@ static bool g_vrDrawIsUP;
 
 static bool g_vrViewsLatched;
 static VRViews g_vrViews;
+
+// The frame is a cutscene shown on the floating screen.
+static bool g_vrFrameIsCutscene;
 static VREyeState g_vrEyes[2];
 static uint32_t g_vrCameraDrawCount;
 
@@ -1213,6 +1219,11 @@ struct VRDrawStatistics
     // Boost blur passes left without their effect.
     uint32_t boostPassesNeutralised;
 
+    // Depth of field passes left without their effect, and frames of cutscenes
+    // shown on the floating screen.
+    uint32_t depthOfFieldNeutralised;
+    uint32_t cutsceneFrames;
+
     // Persistent bloom passes given this frame's bloom for the previous one, the
     // game's persistence factor, and how often the previous one had been
     // resolved from the pass's own target (the feedback loop).
@@ -1261,6 +1272,19 @@ static bool g_vrMainLensValid;
 static bool g_vrMainLensSeenThisFrame;
 static float g_vrMainLensX;
 static float g_vrMainLensY;
+
+// The game camera's view, from the frame's first scene-sized camera draw (or,
+// before that draw, an earlier frame's), for the horizon lock.
+static bool g_vrMainViewValid;
+static XrMatrix g_vrMainView;
+
+// The game camera as last drawn, for the guest (Video::GetVRCameraState).
+static std::mutex g_vrCameraStateMutex;
+static bool g_vrCameraStateValid;
+static std::chrono::steady_clock::time_point g_vrCameraStateTime;
+static float g_vrCameraStateLensX;
+static float g_vrCameraStateLensY;
+static XrMatrix g_vrCameraStateHorizonLock = XrMatrixIdentity();
 
 // The surface the reflection map (g_ReflectionMapSampler) was last resolved from,
 // as the left eye's draws read it, and its value latched at the start of the
@@ -1357,6 +1381,16 @@ static void BeginVRFrame()
     g_vrMainLensSeenThisFrame = false;
     g_vrReflectionSurface = g_vrReflectionSurfaceSeen;
 
+    // Cutscenes go on the floating screen as the game frames them ([VR]
+    // VRCutsceneScreen): their cuts and camera moves are hard to watch around
+    // the head. With no views latched, nothing is drawn per eye.
+    g_vrFrameIsCutscene = Config::VRCutsceneScreen && InspirePatches::s_sceneActive;
+    if (g_vrFrameIsCutscene)
+    {
+        g_vrViewsLatched = true;
+        ++g_vrStatistics.cutsceneFrames;
+    }
+
     g_vrSnapshot.viewport = g_viewport;
     g_vrSnapshot.pipelineState = g_pipelineState;
     g_vrSnapshot.depthBias = g_depthBias;
@@ -1419,6 +1453,103 @@ static void RestoreVRFrameStart(GuestSurface* backBuffer)
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
 }
 
+static void NormalizeVR3(float* v)
+{
+    float length = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (length > 0.0f)
+    {
+        v[0] /= length;
+        v[1] /= length;
+        v[2] /= length;
+    }
+}
+
+// The horizon lock: a rotation of the game camera's view space that takes out
+// the camera's roll ([VR] VRLockRoll) and pitch ([VR] VRLockPitch), so that the
+// eyes see the horizon level and the head alone tilts the view. The HUD panel
+// sits in the levelled space. Identity when the camera looks straight up or
+// down and the lock would be undefined.
+static XrMatrix GetVRHorizonLock()
+{
+    XrMatrix lock = XrMatrixIdentity();
+    if (!g_vrMainViewValid || (!Config::VRLockRoll && !Config::VRLockPitch))
+        return lock;
+
+    // The camera's axes in the world are the view's columns (row vectors: viewPoint = worldPoint * view).
+    const float* v = g_vrMainView.m;
+    float axes[3][3] =
+    {
+        { v[0], v[4], v[8] },  // right
+        { v[1], v[5], v[9] },  // up
+        { v[2], v[6], v[10] }  // back
+    };
+
+    for (auto& axis : axes)
+        NormalizeVR3(axis);
+
+    float forward[3] = { -axes[2][0], -axes[2][1], -axes[2][2] };
+    float levelAxes[3][3];
+
+    if (Config::VRLockPitch)
+    {
+        // The heading alone; looking straight down or up, the up axis gives it.
+        float headingX = forward[0], headingZ = forward[2];
+        if (headingX * headingX + headingZ * headingZ < 0.05f * 0.05f)
+        {
+            float sign = forward[1] < 0.0f ? 1.0f : -1.0f;
+            headingX = sign * axes[1][0];
+            headingZ = sign * axes[1][2];
+        }
+
+        float length = sqrtf(headingX * headingX + headingZ * headingZ);
+        if (length < 1.0e-4f)
+            return lock;
+
+        headingX /= length;
+        headingZ /= length;
+
+        // right = forward x up, up = +Y, back = -forward.
+        float levelRight[3] = { -headingZ, 0.0f, headingX };
+        float levelUp[3] = { 0.0f, 1.0f, 0.0f };
+        float levelBack[3] = { -headingX, 0.0f, -headingZ };
+        memcpy(levelAxes[0], levelRight, sizeof(levelRight));
+        memcpy(levelAxes[1], levelUp, sizeof(levelUp));
+        memcpy(levelAxes[2], levelBack, sizeof(levelBack));
+    }
+    else
+    {
+        // The forward axis kept; the right axis flattened onto the floor.
+        float levelRight[3] = { -forward[2], 0.0f, forward[0] };
+        float length = sqrtf(levelRight[0] * levelRight[0] + levelRight[2] * levelRight[2]);
+        if (length < 0.05f)
+            return lock;
+
+        levelRight[0] /= length;
+        levelRight[2] /= length;
+
+        // up = right x forward.
+        float levelUp[3] =
+        {
+            levelRight[1] * forward[2] - levelRight[2] * forward[1],
+            levelRight[2] * forward[0] - levelRight[0] * forward[2],
+            levelRight[0] * forward[1] - levelRight[1] * forward[0]
+        };
+
+        memcpy(levelAxes[0], levelRight, sizeof(levelRight));
+        memcpy(levelAxes[1], levelUp, sizeof(levelUp));
+        memcpy(levelAxes[2], axes[2], sizeof(axes[2]));
+    }
+
+    // view * lock = levelled view: lock = transpose(axes) * levelAxes.
+    for (size_t i = 0; i < 3; i++)
+    {
+        for (size_t j = 0; j < 3; j++)
+            lock.m[i * 4 + j] = axes[i][0] * levelAxes[j][0] + axes[i][1] * levelAxes[j][1] + axes[i][2] * levelAxes[j][2];
+    }
+
+    return lock;
+}
+
 static void LatchVRViews()
 {
     g_vrViewsLatched = true;
@@ -1439,12 +1570,17 @@ static void LatchVRViews()
     panel.m[5] = halfWidth / aspectRatio;
     panel.m[14] = -std::max(0.1f, Config::VRHudDistance.Value) * unitsPerMeter;
 
+    XrMatrix horizonLock = GetVRHorizonLock();
+
     for (size_t i = 0; i < 2; i++)
     {
         const VRViews::Eye& eye = g_vrViews.eyes[i];
         VREyeState& eyeState = g_vrEyes[i];
         XrProjectionFrustumTerms(eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown, eyeState.projectionTerms);
-        eyeState.eyeFromView = XrMatrixEyeFromView(eye.orientation, eye.position, unitsPerMeter);
+
+        // The world goes through the horizon lock first; the HUD panel is already level.
+        XrMatrix eyeFromLevelled = XrMatrixEyeFromView(eye.orientation, eye.position, unitsPerMeter);
+        eyeState.eyeFromView = XrMatrixMultiply(horizonLock, eyeFromLevelled);
 
         // Only x, y and w matter: the HUD keeps its own depth.
         XrMatrix projection{};
@@ -1454,7 +1590,7 @@ static void LatchVRViews()
         projection.m[9] = eyeState.projectionTerms[3];
         projection.m[11] = -1.0f;
 
-        eyeState.hudMatrix = XrMatrixMultiply(XrMatrixMultiply(panel, eyeState.eyeFromView), projection);
+        eyeState.hudMatrix = XrMatrixMultiply(XrMatrixMultiply(panel, eyeFromLevelled), projection);
     }
 }
 
@@ -1954,6 +2090,7 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
     size_t projection = size_t(vertexShader->vrProjectionRegister) * 4;
     float projection23 = LoadGuestConstant(g_vertexShaderConstants, projection + 11);
     float projection33 = LoadGuestConstant(g_vertexShaderConstants, projection + 15);
+
     if (std::abs(projection23 + 1.0f) > 0.001f || std::abs(projection33) > 0.001f)
     {
         XrMatrix view, gameProjection, worldToClip;
@@ -2039,6 +2176,18 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
             g_vrMainLensValid = true;
             g_vrMainLensSeenThisFrame = true;
 
+            g_vrMainView = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrViewRegister);
+            g_vrMainViewValid = true;
+
+            {
+                std::lock_guard lock(g_vrCameraStateMutex);
+                g_vrCameraStateValid = true;
+                g_vrCameraStateTime = std::chrono::steady_clock::now();
+                g_vrCameraStateLensX = lensX;
+                g_vrCameraStateLensY = lensY;
+                g_vrCameraStateHorizonLock = GetVRHorizonLock();
+            }
+
             if (!g_vrStatistics.mainSampleTaken)
             {
                 g_vrStatistics.mainSampleTaken = true;
@@ -2084,6 +2233,18 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
     return g_vrViews.valid ? VRDrawKind::Camera : VRDrawKind::None;
 }
 
+bool Video::GetVRCameraState(float& lensX, float& lensY, float horizonLock[16])
+{
+    std::lock_guard lock(g_vrCameraStateMutex);
+    if (!g_vrCameraStateValid || std::chrono::steady_clock::now() - g_vrCameraStateTime > std::chrono::seconds(1))
+        return false;
+
+    lensX = g_vrCameraStateLensX;
+    lensY = g_vrCameraStateLensY;
+    memcpy(horizonLock, g_vrCameraStateHorizonLock.m, sizeof(g_vrCameraStateHorizonLock.m));
+    return true;
+}
+
 static void LogVRStatistics()
 {
     static auto s_lastLogTime = std::chrono::steady_clock::now();
@@ -2108,12 +2269,13 @@ static void LogVRStatistics()
 
     LOGFN("[VR] Last 5 s, 2D draws into the back buffer: on the panel {}, full screen {}, left in place {} (last: shader {:016X}, stride {}, position type {:X}, {}). "
         "Boost passes neutralised {}. Bloom feedback replaced {} (persistence {:.3f}, history from its own target {}). "
-        "Light shaft passes {} ({} with the light behind the eye; last at {:.3f}, {:.3f}, for the left eye {:.3f}, {:.3f}).",
+        "Light shaft passes {} ({} with the light behind the eye; last at {:.3f}, {:.3f}, for the left eye {:.3f}, {:.3f}). "
+        "Depth of field passes neutralised {}. Cutscene frames on the screen {}.",
         s.twoDOnPanel, s.twoDFullScreen, s.twoDUnhandled, s.lastUnhandledShader, s.lastUnhandledStride,
         s.lastUnhandledPositionType, s.lastUnhandledReason != nullptr ? s.lastUnhandledReason : "-", s.boostPassesNeutralised,
         s.bloomFeedbackReplaced, s.lastBloomPersistence, s.bloomHistoryFromOwnTarget,
         s.lightShaftPasses, s.lightShaftsBehind, s.lastLightShaftGame[0], s.lastLightShaftGame[1],
-        s.lastLightShaftEye[0], s.lastLightShaftEye[1]);
+        s.lastLightShaftEye[0], s.lastLightShaftEye[1], s.depthOfFieldNeutralised, s.cutsceneFrames);
 
     if (s.viewLockedCsd != 0 || s.viewLocked2D != 0 || s.viewLockedBuffer2D != 0 || s.viewLockedOrtho != 0)
     {
@@ -2400,12 +2562,13 @@ static void NeutraliseVRBoostPass(float* constants)
 // so each eye would carry a ghost of the other eye's glow, one that also trails
 // behind head turns. Unless [VR] VRBloomPersistence asks for it, sampDif1 reads
 // this frame's bright pass instead, weighted by k / (1 - k): the glow a steady
-// scene builds up over frames, without the history. The weight is capped (k at
+// scene builds up over frames, without the history. Flat frames are drawn once
+// and keep it. The weight is capped (k at
 // 0.75), as the history also smooths the flicker of small bright spots.
 static bool ShouldReplaceVRBloomFeedback()
 {
     GuestShader* shader = g_pipelineState.pixelShader;
-    return g_vrPass >= 0 && shader != nullptr && shader->vrPersistentBloomShader && !Config::VRBloomPersistence;
+    return g_vrPass >= 0 && shader != nullptr && shader->vrPersistentBloomShader && !Config::VRBloomPersistence && IsVRFrameImmersive();
 }
 
 static void NoteVRBloomFeedback(GuestSurface* renderTarget)
@@ -2505,6 +2668,26 @@ static void PatchVRLightShafts(float* constants)
         g_vrStatistics.lastLightShaftEye[0] = sun[0];
         g_vrStatistics.lastLightShaftEye[1] = sun[1];
     }
+}
+
+// Depth of field (AlternativeDOF, AlternativeDOF_IgnoreSky) blends each pixel
+// towards blurred copies by weights saturate(blur * g_dofLerpScaleBias[0] +
+// g_dofLerpScaleBias[1]) (c166, c167). In stereo frames the game focuses where
+// its own camera looks, not where the eyes do; unless [VR] VRDepthOfField asks
+// for it, the weights are zero and the pass outputs the sharp picture. Flat
+// frames (cutscenes on the floating screen) keep it.
+static bool ShouldNeutraliseVRDepthOfField()
+{
+    GuestShader* shader = g_pipelineState.pixelShader;
+    return g_vrPass >= 0 && shader != nullptr && shader->vrDepthOfFieldShader && !Config::VRDepthOfField && IsVRFrameImmersive();
+}
+
+static void NeutraliseVRDepthOfField(float* constants)
+{
+    memset(constants + 166 * 4, 0, 8 * sizeof(float));
+
+    if (g_vrPass == 0)
+        ++g_vrStatistics.depthOfFieldNeutralised;
 }
 
 template<GuestRenderState TType>
@@ -4841,6 +5024,7 @@ static void ExecuteVROutput()
 
         g_vrFrameResult.mode = g_vrImages.screen != nullptr ? VRFrameMode::Flat : VRFrameMode::None;
         g_vrFrameResult.views = {};
+        g_vrFrameResult.cutscene = g_vrFrameIsCutscene;
     }
 
     ++(immersive ? g_vrStatistics.immersiveFrames : g_vrStatistics.flatFrames);
@@ -6478,9 +6662,9 @@ static void FlushRenderStateForRenderThread()
     if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
         commandList->setDepthBias(g_depthBias, 0.0f, g_slopeScaledDepthBias);
 
-    // VR: draws through the game camera get the current eye's camera, boost
-    // passes lose their effect, the persistent bloom loses its history, and light
-    // shafts head for the light as the eye sees it.
+    // VR: draws through the game camera get the current eye's camera, boost and
+    // depth of field passes lose their effect, the persistent bloom loses its
+    // history, and light shafts head for the light as the eye sees it.
     // Constants uploaded for one kind of draw are not reused for another.
     if (g_vrPass == 0)
     {
@@ -6498,6 +6682,7 @@ static void FlushRenderStateForRenderThread()
     bool vrNeutraliseBoost = ShouldNeutraliseVRBoostPass();
     bool vrReplaceBloomFeedback = ShouldReplaceVRBloomFeedback();
     bool vrPatchLightShafts = ShouldPatchVRLightShafts();
+    bool vrNeutraliseDepthOfField = ShouldNeutraliseVRDepthOfField();
 
     if (vrReplaceBloomFeedback && g_vrPass == 0)
         NoteVRBloomFeedback(renderTarget);
@@ -6520,7 +6705,7 @@ static void FlushRenderStateForRenderThread()
             vrPixelPatchShader = g_pipelineState.pixelShader;
     }
 
-    if (vrNeutraliseBoost || vrReplaceBloomFeedback || vrPatchLightShafts)
+    if (vrNeutraliseBoost || vrReplaceBloomFeedback || vrPatchLightShafts || vrNeutraliseDepthOfField)
         vrPixelPatchShader = g_pipelineState.pixelShader;
 
     if (vrReplaceBloomFeedback != g_vrSharedPatch)
@@ -6573,6 +6758,9 @@ static void FlushRenderStateForRenderThread()
 
         if (vrPatchLightShafts)
             PatchVRLightShafts(reinterpret_cast<float*>(pixelShaderConstants.memory));
+
+        if (vrNeutraliseDepthOfField)
+            NeutraliseVRDepthOfField(reinterpret_cast<float*>(pixelShaderConstants.memory));
 
         SetRootDescriptor(pixelShaderConstants, 1);
     }
@@ -7223,6 +7411,7 @@ static GuestShader* CreateShader(const be<uint32_t>* function, ResourceType reso
 
             shader->vrPersistentBloomShader = (hash == 0x605C1E349CC4CAAB); // Bloom_BrightPassPersistent.xpu
             shader->vrLightShaftShader = (hash == 0x66578F29004F8FD0); // LightShaftFilter.xpu
+            shader->vrDepthOfFieldShader = (hash == 0xFB79F59782376846 || hash == 0x65325B9C7DA3DB04); // AlternativeDOF(_IgnoreSky).xpu
 
             if (shader->shaderCacheEntry != nullptr)
                 FindVRCameraConstants(shader, function);

@@ -498,6 +498,13 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
             hid::g_inputDevice = hid::EInputDevice::Xbox;
     }
 
+    // VR: both thumbsticks held in recentre the view, from any pad.
+    if (userIndex == 0)
+    {
+        constexpr uint16_t BothThumbsticks = XAMINPUT_GAMEPAD_LEFT_THUMB | XAMINPUT_GAMEPAD_RIGHT_THUMB;
+        VR::UpdateRecenterButtons((state->Gamepad.wButtons & BothThumbsticks) == BothThumbsticks);
+    }
+
     state->Gamepad.wButtons &= ~hid::g_prohibitedButtons;
 
     if (hid::g_isLeftStickProhibited)

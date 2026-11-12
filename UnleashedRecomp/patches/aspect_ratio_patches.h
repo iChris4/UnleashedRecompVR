@@ -15,3 +15,6 @@ struct AspectRatioPatches
 {
     static void ComputeOffsets();
 };
+
+// The world map is up (its state updated within the last half second). Any thread.
+bool IsWorldMapActive();

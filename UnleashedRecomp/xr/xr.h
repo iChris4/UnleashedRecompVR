@@ -3,9 +3,10 @@
 #include <plume_render_interface.h>
 #include <xbox.h>
 
-// The headset's views for one frame, for the renderer. Orientations are in the
-// application space; positions are in metres from the head position the view
-// was last recentred on, which is where the game camera stands.
+// The headset's views for one frame, for the renderer. Orientations and
+// positions (in metres) are relative to the head pose the view was last
+// recentred on (its position and heading), which is where the game camera
+// stands and looks.
 struct VRViews
 {
     struct Eye
@@ -16,6 +17,10 @@ struct VRViews
         float angleRight;
         float angleUp;
         float angleDown;
+
+        // The pose in the application space, as submitted to the runtime.
+        float spaceOrientation[4];
+        float spacePosition[3];
     };
 
     bool valid = false;
@@ -46,6 +51,9 @@ enum class VRFrameMode
 struct VRFrameResult
 {
     VRFrameMode mode = VRFrameMode::None;
+
+    // A cutscene on the floating screen: only its 16:9 middle is shown.
+    bool cutscene = false;
 
     // The views the eyes were rendered with (immersive frames).
     VRViews views;
@@ -97,8 +105,13 @@ struct VR
     static void GetViews(VRViews& views);
 
     // Recentres on the head: the game camera and the screen move in front of it.
-    // The runtime's own recenter (a reference space change) does the same.
+    // The runtime's own recenter (a reference space change) and holding both
+    // thumbsticks in do the same.
     static void Recenter();
+
+    // The game's pad (the first user's, real and motion controllers merged), as
+    // the game reads it: both thumbsticks held in for a second recentre. Any thread.
+    static void UpdateRecenterButtons(bool bothThumbsticksHeld);
 
     // The format the headset images are rendered in before they are copied
     // into the swapchain images, and the per-eye render resolution.
@@ -129,6 +142,7 @@ struct VR
     static bool EndFrame(const VRFrameResult&) { return false; }
     static void GetViews(VRViews& views) { views = {}; }
     static void Recenter() {}
+    static void UpdateRecenterButtons(bool) {}
     static plume::RenderFormat GetImageFormat() { return plume::RenderFormat::B8G8R8A8_UNORM; }
     static uint32_t GetRenderWidth() { return 1920; }
     static uint32_t GetRenderHeight() { return 1080; }

@@ -9,6 +9,7 @@
 #include "aspect_ratio_patches.h"
 #include "camera_patches.h"
 #include "inspire_patches.h"
+#include <xr/xr.h>
 
 // These are here for now to not recompile basically all of the project.
 namespace Chao::CSD
@@ -234,15 +235,22 @@ PPC_FUNC(sub_8250FC70)
     __imp__sub_8250FC70(ctx, base);
 
     auto position = reinterpret_cast<be<float>*>(base + ctx.r3.u32);
+    float x = position[0];
+    float y = position[1];
+    MapVRScreenPosition(x, y);
 
-    position[0] = (position[0] / 1280.0f * Video::s_viewportWidth - g_aspectRatioOffsetX) / g_aspectRatioScale;
-    position[1] = (position[1] / 720.0f * Video::s_viewportHeight - g_aspectRatioOffsetY) / g_aspectRatioScale;
+    position[0] = (x / 1280.0f * Video::s_viewportWidth - g_aspectRatioOffsetX) / g_aspectRatioScale;
+    position[1] = (y / 720.0f * Video::s_viewportHeight - g_aspectRatioOffsetY) / g_aspectRatioScale;
 }
 
 void ComputeScreenPositionMidAsmHook(PPCRegister& f1, PPCRegister& f2)
 {
-    f1.f64 = (f1.f64 / 1280.0 * Video::s_viewportWidth - g_aspectRatioOffsetX) / g_aspectRatioScale;
-    f2.f64 = (f2.f64 / 720.0 * Video::s_viewportHeight - g_aspectRatioOffsetY) / g_aspectRatioScale;
+    float x = float(f1.f64);
+    float y = float(f2.f64);
+    MapVRScreenPosition(x, y);
+
+    f1.f64 = (x / 1280.0 * Video::s_viewportWidth - g_aspectRatioOffsetX) / g_aspectRatioScale;
+    f2.f64 = (y / 720.0 * Video::s_viewportHeight - g_aspectRatioOffsetY) / g_aspectRatioScale;
 }
 
 void WorldMapInfoMidAsmHook(PPCRegister& r4)
@@ -252,10 +260,20 @@ void WorldMapInfoMidAsmHook(PPCRegister& r4)
     r4.u32 = 0x8200A621;
 }
 
+static std::atomic<std::chrono::steady_clock::rep> g_worldMapUpdateTime;
+
+bool IsWorldMapActive()
+{
+    auto elapsed = std::chrono::steady_clock::now().time_since_epoch().count() - g_worldMapUpdateTime.load();
+    return elapsed >= 0 && elapsed < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500)).count();
+}
+
 // SWA::CTitleStateWorldMap::Update
 PPC_FUNC_IMPL(__imp__sub_8258B558);
 PPC_FUNC(sub_8258B558)
 {
+    g_worldMapUpdateTime = std::chrono::steady_clock::now().time_since_epoch().count();
+
     auto r3 = ctx.r3;
     __imp__sub_8258B558(ctx, base);
 
@@ -1457,7 +1475,11 @@ PPC_FUNC_IMPL(__imp__sub_82B8AA40);
 PPC_FUNC(sub_82B8AA40)
 {
     bool letterbox = PPC_LOAD_U8(ctx.r3.u32);
-    bool shouldDrawLetterbox = letterbox && Config::CutsceneAspectRatio != ECutsceneAspectRatio::Unlocked && g_aspectRatio < WIDE_ASPECT_RATIO;
+
+    // VR: cutscenes on the floating screen show their 16:9 middle, which the
+    // letterbox would cover in part.
+    bool vrCutsceneScreen = VR::IsActive() && Config::VRCutsceneScreen;
+    bool shouldDrawLetterbox = letterbox && Config::CutsceneAspectRatio != ECutsceneAspectRatio::Unlocked && g_aspectRatio < WIDE_ASPECT_RATIO && !vrCutsceneScreen;
 
     PPC_STORE_U8(ctx.r3.u32, shouldDrawLetterbox);
     if (shouldDrawLetterbox)
@@ -1500,7 +1522,10 @@ void InspireSubtitleMidAsmHook(PPCRegister& r3)
     constexpr float NARROW_OFFSET = 485.0f;
     constexpr float WIDE_OFFSET = 560.0f;
 
-    *reinterpret_cast<be<float>*>(g_memory.base + r3.u32 + 0x3C) = NARROW_OFFSET + (WIDE_OFFSET - NARROW_OFFSET) * g_aspectRatioNarrowScale;
+    // VR: the floating screen shows the cutscene's 16:9 middle, where the subtitles go as on a wide screen.
+    float narrowScale = (VR::IsActive() && Config::VRCutsceneScreen) ? 1.0f : g_aspectRatioNarrowScale;
+
+    *reinterpret_cast<be<float>*>(g_memory.base + r3.u32 + 0x3C) = NARROW_OFFSET + (WIDE_OFFSET - NARROW_OFFSET) * narrowScale;
 }
 
 enum class FadeTextureMode

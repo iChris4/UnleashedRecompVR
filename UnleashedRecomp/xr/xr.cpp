@@ -6,6 +6,9 @@
 #include <os/logger.h>
 #include <user/config.h>
 
+#include <atomic>
+#include <chrono>
+
 struct XrSwapchainState
 {
     XrSwapchain handle = XR_NULL_HANDLE;
@@ -32,10 +35,11 @@ static PortVr::OpenXRFrame g_frame;
 static bool g_frameBegun;
 static std::atomic<bool> g_inputFocused;
 
-// The head position the game camera stands at, set on the first tracked frame
-// and on every recenter.
+// The head pose the game camera stands at (its position and heading), set on
+// the first tracked frame and on every recenter.
 static bool g_baseValid;
 static XrVector3f g_basePosition;
+static float g_baseYaw;
 
 static std::mutex g_viewsMutex;
 static VRViews g_views;
@@ -46,6 +50,14 @@ static bool g_screenPlaced;
 static XrPosef g_screenPose{ { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f } };
 
 static VRFrameMode g_lastFrameMode = VRFrameMode::None;
+
+// Both thumbsticks held in for this long recentre the view, once per hold.
+static constexpr auto RECENTER_HOLD_TIME = std::chrono::seconds(1);
+static std::mutex g_recenterMutex;
+static bool g_recenterHeld;
+static bool g_recenterDone;
+static std::chrono::steady_clock::time_point g_recenterHeldSince;
+static std::atomic<bool> g_recenterRequested;
 
 static void LogOpenXR(PortVr::OpenXRLogLevel level, std::string_view message)
 {
@@ -163,6 +175,18 @@ static bool ReleaseSwapchain(XrSwapchainState& swapchain)
     return true;
 }
 
+// The heading of an orientation: the angle about +Y that turns -Z towards its
+// forward axis flattened onto the floor.
+static float GetHeading(const XrQuaternionf& q)
+{
+    float forwardX = -2.0f * (q.x * q.z + q.w * q.y);
+    float forwardZ = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    if ((forwardX * forwardX + forwardZ * forwardZ) <= 1.0e-6f)
+        return 0.0f;
+
+    return atan2f(-forwardX, -forwardZ);
+}
+
 static void PlaceScreen()
 {
     XrSpaceLocation location{ XR_TYPE_SPACE_LOCATION };
@@ -174,13 +198,7 @@ static void PlaceScreen()
     if ((location.locationFlags & RequiredFlags) != RequiredFlags)
         return;
 
-    // The head's forward (-Z) in the application space, flattened to its heading.
-    const XrQuaternionf& q = location.pose.orientation;
-    float forwardX = -2.0f * (q.x * q.z + q.w * q.y);
-    float forwardZ = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
-    float yaw = 0.0f;
-    if ((forwardX * forwardX + forwardZ * forwardZ) > 1.0e-6f)
-        yaw = atan2f(-forwardX, -forwardZ);
+    float yaw = GetHeading(location.pose.orientation);
 
     float distance = std::max(0.25f, Config::VRScreenDistance.Value);
 
@@ -199,11 +217,13 @@ static void PublishViews()
     {
         const XrView* xrViews = g_frame.views.data();
 
-        if (!g_baseValid && (g_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0)
+        constexpr XrViewStateFlags RequiredFlags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+        if (!g_baseValid && (g_frame.view_state_flags & RequiredFlags) == RequiredFlags)
         {
             g_basePosition.x = 0.5f * (xrViews[0].pose.position.x + xrViews[1].pose.position.x);
             g_basePosition.y = 0.5f * (xrViews[0].pose.position.y + xrViews[1].pose.position.y);
             g_basePosition.z = 0.5f * (xrViews[0].pose.position.z + xrViews[1].pose.position.z);
+            g_baseYaw = GetHeading(xrViews[0].pose.orientation);
             g_baseValid = true;
         }
 
@@ -214,17 +234,38 @@ static void PublishViews()
             views.basePosition[1] = g_basePosition.y;
             views.basePosition[2] = g_basePosition.z;
 
+            // Undo the base heading: a rotation of -yaw about +Y.
+            float sinHalf = sinf(-0.5f * g_baseYaw);
+            float cosHalf = cosf(-0.5f * g_baseYaw);
+            float sinYaw = sinf(-g_baseYaw);
+            float cosYaw = cosf(-g_baseYaw);
+
             for (uint32_t i = 0; i < 2; i++)
             {
                 const XrView& xrView = xrViews[i];
+                const XrQuaternionf& q = xrView.pose.orientation;
                 VRViews::Eye& eye = views.eyes[i];
-                eye.orientation[0] = xrView.pose.orientation.x;
-                eye.orientation[1] = xrView.pose.orientation.y;
-                eye.orientation[2] = xrView.pose.orientation.z;
-                eye.orientation[3] = xrView.pose.orientation.w;
-                eye.position[0] = xrView.pose.position.x - g_basePosition.x;
-                eye.position[1] = xrView.pose.position.y - g_basePosition.y;
-                eye.position[2] = xrView.pose.position.z - g_basePosition.z;
+
+                // (0, sinHalf, 0, cosHalf) * q
+                eye.orientation[0] = cosHalf * q.x + sinHalf * q.z;
+                eye.orientation[1] = cosHalf * q.y + sinHalf * q.w;
+                eye.orientation[2] = cosHalf * q.z - sinHalf * q.x;
+                eye.orientation[3] = cosHalf * q.w - sinHalf * q.y;
+
+                float x = xrView.pose.position.x - g_basePosition.x;
+                float y = xrView.pose.position.y - g_basePosition.y;
+                float z = xrView.pose.position.z - g_basePosition.z;
+                eye.position[0] = x * cosYaw + z * sinYaw;
+                eye.position[1] = y;
+                eye.position[2] = -x * sinYaw + z * cosYaw;
+
+                eye.spaceOrientation[0] = q.x;
+                eye.spaceOrientation[1] = q.y;
+                eye.spaceOrientation[2] = q.z;
+                eye.spaceOrientation[3] = q.w;
+                eye.spacePosition[0] = xrView.pose.position.x;
+                eye.spacePosition[1] = xrView.pose.position.y;
+                eye.spacePosition[2] = xrView.pose.position.z;
                 eye.angleLeft = xrView.fov.angleLeft;
                 eye.angleRight = xrView.fov.angleRight;
                 eye.angleUp = xrView.fov.angleUp;
@@ -379,6 +420,14 @@ void VR::BeginFrame()
         g_screenPlaced = false;
     }
 
+    // Both thumbsticks held in (see UpdateRecenterButtons).
+    if (g_recenterRequested.exchange(false))
+    {
+        LOGN("[VR] Recentred.");
+        g_baseValid = false;
+        g_screenPlaced = false;
+    }
+
     if (g_frame.should_render && !g_screenPlaced)
         PlaceScreen();
 
@@ -453,13 +502,8 @@ bool VR::EndFrame(const VRFrameResult& result)
             const VRViews::Eye& eye = result.views.eyes[i];
             XrCompositionLayerProjectionView& view = projectionViews[i];
             view = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-            view.pose.orientation = { eye.orientation[0], eye.orientation[1], eye.orientation[2], eye.orientation[3] };
-            view.pose.position =
-            {
-                eye.position[0] + result.views.basePosition[0],
-                eye.position[1] + result.views.basePosition[1],
-                eye.position[2] + result.views.basePosition[2]
-            };
+            view.pose.orientation = { eye.spaceOrientation[0], eye.spaceOrientation[1], eye.spaceOrientation[2], eye.spaceOrientation[3] };
+            view.pose.position = { eye.spacePosition[0], eye.spacePosition[1], eye.spacePosition[2] };
             view.fov = { eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown };
             view.subImage.swapchain = g_eyeSwapchains[i].handle;
             view.subImage.imageRect = { { 0, 0 }, { int32_t(g_eyeSwapchains[i].width), int32_t(g_eyeSwapchains[i].height) } };
@@ -483,6 +527,17 @@ bool VR::EndFrame(const VRFrameResult& result)
     quad.subImage.imageRect = { { 0, 0 }, { int32_t(g_screenSwapchain.width), int32_t(g_screenSwapchain.height) } };
     quad.subImage.imageArrayIndex = 0;
 
+    // A cutscene is drawn for the eyes' shape with more above and below than the
+    // game frames (vertical field of view widened): its 16:9 middle is the shot.
+    if (result.cutscene)
+    {
+        int32_t width = int32_t(g_screenSwapchain.width);
+        int32_t height = int32_t(g_screenSwapchain.height);
+        int32_t shotWidth = std::min(width, height * 16 / 9);
+        int32_t shotHeight = std::min(height, width * 9 / 16);
+        quad.subImage.imageRect = { { (width - shotWidth) / 2, (height - shotHeight) / 2 }, { shotWidth, shotHeight } };
+    }
+
     if (g_screenPlaced)
     {
         quad.space = g_runtime->AppSpace();
@@ -498,7 +553,7 @@ bool VR::EndFrame(const VRFrameResult& result)
 
     // VRScreenWidth is the width of a 16:9 screen; other shapes keep its height.
     quad.size.height = std::max(0.25f, Config::VRScreenWidth.Value) * 9.0f / 16.0f;
-    quad.size.width = quad.size.height * float(g_screenSwapchain.width) / float(g_screenSwapchain.height);
+    quad.size.width = quad.size.height * float(quad.subImage.imageRect.extent.width) / float(quad.subImage.imageRect.extent.height);
 
     const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad) };
     g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
@@ -517,6 +572,31 @@ void VR::Recenter()
     std::lock_guard lock(g_mutex);
     g_baseValid = false;
     g_screenPlaced = false;
+}
+
+void VR::UpdateRecenterButtons(bool bothThumbsticksHeld)
+{
+    if (!IsActive())
+        return;
+
+    std::lock_guard lock(g_recenterMutex);
+    auto now = std::chrono::steady_clock::now();
+
+    if (!bothThumbsticksHeld)
+    {
+        g_recenterHeld = false;
+        g_recenterDone = false;
+    }
+    else if (!g_recenterHeld)
+    {
+        g_recenterHeld = true;
+        g_recenterHeldSince = now;
+    }
+    else if (!g_recenterDone && now - g_recenterHeldSince >= RECENTER_HOLD_TIME)
+    {
+        g_recenterDone = true;
+        g_recenterRequested = true;
+    }
 }
 
 plume::RenderFormat VR::GetImageFormat()

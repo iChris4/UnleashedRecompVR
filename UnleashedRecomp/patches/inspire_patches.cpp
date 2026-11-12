@@ -44,6 +44,7 @@ PPC_FUNC(sub_82B98D80)
     __imp__sub_82B98D80(ctx, base);
 
     g_pScene = (SWA::Inspire::CScene*)g_memory.Translate(ctx.r3.u32);
+    InspirePatches::s_sceneActive = true;
     g_isFirstFrameChecked = false;
     g_eventDispatchCount = 0;
 }
@@ -55,6 +56,7 @@ PPC_FUNC(sub_82B98D30)
     __imp__sub_82B98D30(ctx, base);
 
     g_pScene = nullptr;
+    InspirePatches::s_sceneActive = false;
     InspirePatches::s_sceneName.clear();
 
     SDL_User_EvilSonic(App::s_isWerehog);

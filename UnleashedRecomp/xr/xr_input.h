@@ -16,6 +16,9 @@ namespace PortVr
 //   left menu   -> Start            left menu with the left grip held -> Back
 //   right menu (controllers that have one) -> Back
 //
+// Holding both thumbsticks in for a second recentres the view (see
+// VR::UpdateRecenterButtons); they still reach the game as L3 and R3.
+//
 // Sync runs on the presenting thread once per xrWaitFrame; the game's input
 // threads read the last pad through GetGamepad. Rumble requested by the game is
 // applied to the hands on the next Sync (left motor -> left hand, right -> right).
