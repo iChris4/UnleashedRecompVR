@@ -1475,11 +1475,7 @@ PPC_FUNC_IMPL(__imp__sub_82B8AA40);
 PPC_FUNC(sub_82B8AA40)
 {
     bool letterbox = PPC_LOAD_U8(ctx.r3.u32);
-
-    // VR: cutscenes on the floating screen show their 16:9 middle, which the
-    // letterbox would cover in part.
-    bool vrCutsceneScreen = VR::IsActive() && Config::VRCutsceneScreen;
-    bool shouldDrawLetterbox = letterbox && Config::CutsceneAspectRatio != ECutsceneAspectRatio::Unlocked && g_aspectRatio < WIDE_ASPECT_RATIO && !vrCutsceneScreen;
+    bool shouldDrawLetterbox = letterbox && Config::CutsceneAspectRatio != ECutsceneAspectRatio::Unlocked && g_aspectRatio < WIDE_ASPECT_RATIO;
 
     PPC_STORE_U8(ctx.r3.u32, shouldDrawLetterbox);
     if (shouldDrawLetterbox)
@@ -1522,10 +1518,7 @@ void InspireSubtitleMidAsmHook(PPCRegister& r3)
     constexpr float NARROW_OFFSET = 485.0f;
     constexpr float WIDE_OFFSET = 560.0f;
 
-    // VR: the floating screen shows the cutscene's 16:9 middle, where the subtitles go as on a wide screen.
-    float narrowScale = (VR::IsActive() && Config::VRCutsceneScreen) ? 1.0f : g_aspectRatioNarrowScale;
-
-    *reinterpret_cast<be<float>*>(g_memory.base + r3.u32 + 0x3C) = NARROW_OFFSET + (WIDE_OFFSET - NARROW_OFFSET) * narrowScale;
+    *reinterpret_cast<be<float>*>(g_memory.base + r3.u32 + 0x3C) = NARROW_OFFSET + (WIDE_OFFSET - NARROW_OFFSET) * g_aspectRatioNarrowScale;
 }
 
 enum class FadeTextureMode

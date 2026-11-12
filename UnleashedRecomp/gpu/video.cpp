@@ -70,6 +70,7 @@
 #include "shader/resolve_msaa_depth_4x.hlsl.dxil.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.dxil.h"
 #include "shader/xr_blit_ps.hlsl.dxil.h"
+#include "shader/xr_output_ps.hlsl.dxil.h"
 #include "shader/xr_ui_ps.hlsl.dxil.h"
 #include "shader/xr_ui_vs.hlsl.dxil.h"
 #endif
@@ -98,6 +99,7 @@
 #include "shader/resolve_msaa_depth_4x.hlsl.spirv.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.spirv.h"
 #include "shader/xr_blit_ps.hlsl.spirv.h"
+#include "shader/xr_output_ps.hlsl.spirv.h"
 #include "shader/xr_ui_ps.hlsl.spirv.h"
 #include "shader/xr_ui_vs.hlsl.spirv.h"
 
@@ -363,7 +365,7 @@ static std::unique_ptr<RenderFramebuffer> g_vrOutputFramebuffer;
 static uint32_t g_vrOutputTextureWidth;
 static uint32_t g_vrOutputTextureHeight;
 static uint32_t g_vrOutputTextureDescriptorIndex;
-static std::unique_ptr<RenderPipeline> g_vrGammaCorrectionPipeline;
+static std::unique_ptr<RenderPipeline> g_vrOutputPipeline;
 static std::unique_ptr<RenderPipeline> g_vrMirrorPipeline;
 
 // The headset images acquired for the frame being presented. Written by the
@@ -1118,6 +1120,8 @@ struct VREyeState
 // The UI drawn with ImGui in stereo frames: drawn once into this texture during
 // the left eye's pass, then put on the HUD panel in each eye.
 static std::unique_ptr<RenderTexture> g_vrUiTexture;
+static uint32_t g_vrUiTextureWidth;
+static uint32_t g_vrUiTextureHeight;
 static std::unique_ptr<RenderFramebuffer> g_vrUiFramebuffer;
 static uint32_t g_vrUiTextureDescriptorIndex;
 static std::unique_ptr<RenderPipeline> g_vrUiCompositePipeline;
@@ -1136,8 +1140,6 @@ static bool g_vrDrawIsUP;
 static bool g_vrViewsLatched;
 static VRViews g_vrViews;
 
-// The frame is a cutscene shown on the floating screen.
-static bool g_vrFrameIsCutscene;
 static VREyeState g_vrEyes[2];
 static uint32_t g_vrCameraDrawCount;
 
@@ -1384,8 +1386,7 @@ static void BeginVRFrame()
     // Cutscenes go on the floating screen as the game frames them ([VR]
     // VRCutsceneScreen): their cuts and camera moves are hard to watch around
     // the head. With no views latched, nothing is drawn per eye.
-    g_vrFrameIsCutscene = Config::VRCutsceneScreen && InspirePatches::s_sceneActive;
-    if (g_vrFrameIsCutscene)
+    if (Config::VRCutsceneScreen && InspirePatches::s_sceneActive)
     {
         g_vrViewsLatched = true;
         ++g_vrStatistics.cutsceneFrames;
@@ -3287,15 +3288,21 @@ static void BeginCommandList()
             g_backBuffer->texture = g_swapChain->getTexture(g_backBufferIndex);
         }
 
-        if (VR::IsActive() && (g_vrOutputTextureWidth != width || g_vrOutputTextureHeight != height))
+        // VR: the output texture has the headset images' size, the game's picture
+        // being stretched into it; the UI texture has the back buffer's size and
+        // format, so ImGui's pipelines draw into it.
+        uint32_t outputWidth = VR::GetRenderWidth();
+        uint32_t outputHeight = VR::GetRenderHeight();
+
+        if (VR::IsActive() && (g_vrOutputTextureWidth != outputWidth || g_vrOutputTextureHeight != outputHeight))
         {
             if (g_vrOutputTextureDescriptorIndex == NULL)
                 g_vrOutputTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
 
-            Video::WaitForGPU(); // Only when the screen resolution changes.
+            Video::WaitForGPU(); // Only when the headset's resolution changes.
 
             g_vrOutputFramebuffer.reset();
-            g_vrOutputTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, VR::GetImageFormat(), RenderTextureFlag::RENDER_TARGET));
+            g_vrOutputTexture = g_device->createTexture(RenderTextureDesc::Texture2D(outputWidth, outputHeight, 1, VR::GetImageFormat(), RenderTextureFlag::RENDER_TARGET));
             g_textureDescriptorSet->setTexture(g_vrOutputTextureDescriptorIndex, g_vrOutputTexture.get(), RenderTextureLayout::SHADER_READ);
 
             RenderFramebufferDesc framebufferDesc;
@@ -3304,19 +3311,29 @@ static void BeginCommandList()
             framebufferDesc.colorAttachmentsCount = 1;
             g_vrOutputFramebuffer = g_device->createFramebuffer(framebufferDesc);
 
-            // The UI texture has the back buffer's size and format, so ImGui's pipelines draw into it.
+            g_vrOutputTextureWidth = outputWidth;
+            g_vrOutputTextureHeight = outputHeight;
+        }
+
+        if (VR::IsActive() && (g_vrUiTextureWidth != width || g_vrUiTextureHeight != height))
+        {
             if (g_vrUiTextureDescriptorIndex == NULL)
                 g_vrUiTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
+
+            Video::WaitForGPU(); // Only when the screen resolution changes.
 
             g_vrUiFramebuffer.reset();
             g_vrUiTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
             g_textureDescriptorSet->setTexture(g_vrUiTextureDescriptorIndex, g_vrUiTexture.get(), RenderTextureLayout::SHADER_READ);
 
-            colorAttachment = g_vrUiTexture.get();
+            RenderFramebufferDesc framebufferDesc;
+            const RenderTexture* colorAttachment = g_vrUiTexture.get();
+            framebufferDesc.colorAttachments = &colorAttachment;
+            framebufferDesc.colorAttachmentsCount = 1;
             g_vrUiFramebuffer = g_device->createFramebuffer(framebufferDesc);
 
-            g_vrOutputTextureWidth = width;
-            g_vrOutputTextureHeight = height;
+            g_vrUiTextureWidth = width;
+            g_vrUiTextureHeight = height;
         }
     }
     else
@@ -3802,11 +3819,16 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     if (VR::IsActive())
     {
-        if (VR::GetImageFormat() != BACKBUFFER_FORMAT)
-        {
-            desc.renderTargetFormat[0] = VR::GetImageFormat();
-            g_vrGammaCorrectionPipeline = g_device->createGraphicsPipeline(desc);
-        }
+        auto outputShader = CREATE_SHADER(xr_output_ps);
+
+        desc = {};
+        desc.pipelineLayout = g_pipelineLayout.get();
+        desc.vertexShader = g_copyShader.get();
+        desc.pixelShader = outputShader.get();
+        desc.renderTargetFormat[0] = VR::GetImageFormat();
+        desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+        desc.renderTargetCount = 1;
+        g_vrOutputPipeline = g_device->createGraphicsPipeline(desc);
 
         auto mirrorShader = CREATE_SHADER(xr_blit_ps);
 
@@ -4848,19 +4870,28 @@ static void ComputeGammaCorrection(GammaCorrectionConstants& constants)
     constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
 }
 
-// VR: gamma-corrects the game's picture into the output texture and copies it
-// into a headset image (when there is one).
+// VR: stretches the game's picture over the output texture, gamma-corrected,
+// and copies it into a headset image (when there is one).
 static void OutputVRImage(RenderTexture* target)
 {
     auto& commandList = g_commandLists[g_frame];
 
-    GammaCorrectionConstants constants;
-    ComputeGammaCorrection(constants);
+    GammaCorrectionConstants gamma;
+    ComputeGammaCorrection(gamma);
+
+    struct
+    {
+        float gamma[3];
+        uint32_t textureDescriptorIndex;
+        float inverseOutputSize[2];
+    } constants;
+
+    constants.gamma[0] = gamma.gammaR;
+    constants.gamma[1] = gamma.gammaG;
+    constants.gamma[2] = gamma.gammaB;
     constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
-    constants.viewportOffsetX = 0;
-    constants.viewportOffsetY = 0;
-    constants.viewportWidth = g_vrOutputTextureWidth;
-    constants.viewportHeight = g_vrOutputTextureHeight;
+    constants.inverseOutputSize[0] = 1.0f / float(g_vrOutputTextureWidth);
+    constants.inverseOutputSize[1] = 1.0f / float(g_vrOutputTextureHeight);
 
     RenderTextureBarrier gammaBarriers[] =
     {
@@ -4870,7 +4901,7 @@ static void OutputVRImage(RenderTexture* target)
 
     commandList->barriers(RenderBarrierStage::GRAPHICS, gammaBarriers, std::size(gammaBarriers));
     commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
-    commandList->setPipeline(g_vrGammaCorrectionPipeline != nullptr ? g_vrGammaCorrectionPipeline.get() : g_gammaCorrectionPipeline.get());
+    commandList->setPipeline(g_vrOutputPipeline.get());
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
     SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&constants, sizeof(constants), 0x100), 2);
@@ -4982,8 +5013,8 @@ static void CompositeVRUi()
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
     SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&constants, sizeof(constants), 0x100), 2);
-    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_vrOutputTextureWidth), float(g_vrOutputTextureHeight)));
-    commandList->setScissors(RenderRect(0, 0, g_vrOutputTextureWidth, g_vrOutputTextureHeight));
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_backBuffer->width), float(g_backBuffer->height)));
+    commandList->setScissors(RenderRect(0, 0, g_backBuffer->width, g_backBuffer->height));
     commandList->drawInstanced(6, 1, 0, 0);
 }
 
@@ -5024,7 +5055,7 @@ static void ExecuteVROutput()
 
         g_vrFrameResult.mode = g_vrImages.screen != nullptr ? VRFrameMode::Flat : VRFrameMode::None;
         g_vrFrameResult.views = {};
-        g_vrFrameResult.cutscene = g_vrFrameIsCutscene;
+        g_vrFrameResult.screenAspectRatio = float(Video::s_viewportWidth) / float(std::max(1u, Video::s_viewportHeight));
     }
 
     ++(immersive ? g_vrStatistics.immersiveFrames : g_vrStatistics.flatFrames);
@@ -5132,9 +5163,18 @@ void Video::ComputeViewportDimensions()
 {
     if (VR::IsActive())
     {
-        // The game renders for a screen the shape and resolution of an eye; the window only mirrors the headset.
-        s_viewportWidth = VR::GetRenderWidth();
-        s_viewportHeight = VR::GetRenderHeight();
+        // The game draws for a screen of the configured shape (4:3 for 4:3 and
+        // Original 4:3, 16:9 otherwise) with as many pixels as an eye's image: its
+        // 2D (HUD, menus, movies) is laid out as on that screen, and the HUD panel
+        // and the floating screen take its shape. The eyes' images are stretched
+        // from it, each eye's lens being in the projection it is drawn with. The
+        // window only mirrors the headset.
+        bool narrow = Config::AspectRatio == EAspectRatio::Narrow || Config::AspectRatio == EAspectRatio::OriginalNarrow;
+        double aspectRatio = narrow ? 4.0 / 3.0 : 16.0 / 9.0;
+        double pixels = double(VR::GetRenderWidth()) * double(VR::GetRenderHeight());
+
+        s_viewportHeight = std::max(2u, uint32_t(round(sqrt(pixels / aspectRatio))) & ~1u);
+        s_viewportWidth = std::max(2u, uint32_t(round(s_viewportHeight * aspectRatio)) & ~1u);
         AspectRatioPatches::ComputeOffsets();
         return;
     }

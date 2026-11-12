@@ -52,8 +52,9 @@ struct VRFrameResult
 {
     VRFrameMode mode = VRFrameMode::None;
 
-    // A cutscene on the floating screen: only its 16:9 middle is shown.
-    bool cutscene = false;
+    // The shape of the screen the game drew for (its width over its height),
+    // which the floating screen takes.
+    float screenAspectRatio = 16.0f / 9.0f;
 
     // The views the eyes were rendered with (immersive frames).
     VRViews views;

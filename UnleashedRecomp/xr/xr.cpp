@@ -527,16 +527,6 @@ bool VR::EndFrame(const VRFrameResult& result)
     quad.subImage.imageRect = { { 0, 0 }, { int32_t(g_screenSwapchain.width), int32_t(g_screenSwapchain.height) } };
     quad.subImage.imageArrayIndex = 0;
 
-    // A cutscene is drawn for the eyes' shape with more above and below than the
-    // game frames (vertical field of view widened): its 16:9 middle is the shot.
-    if (result.cutscene)
-    {
-        int32_t width = int32_t(g_screenSwapchain.width);
-        int32_t height = int32_t(g_screenSwapchain.height);
-        int32_t shotWidth = std::min(width, height * 16 / 9);
-        int32_t shotHeight = std::min(height, width * 9 / 16);
-        quad.subImage.imageRect = { { (width - shotWidth) / 2, (height - shotHeight) / 2 }, { shotWidth, shotHeight } };
-    }
 
     if (g_screenPlaced)
     {
@@ -551,9 +541,11 @@ bool VR::EndFrame(const VRFrameResult& result)
         quad.pose.position = { 0.0f, 0.0f, -std::max(0.25f, Config::VRScreenDistance.Value) };
     }
 
-    // VRScreenWidth is the width of a 16:9 screen; other shapes keep its height.
+    // The image holds the game's picture stretched to the eyes' shape: the quad
+    // takes the shape the game drew for. VRScreenWidth is the width of a 16:9
+    // screen; other shapes keep its height.
     quad.size.height = std::max(0.25f, Config::VRScreenWidth.Value) * 9.0f / 16.0f;
-    quad.size.width = quad.size.height * float(quad.subImage.imageRect.extent.width) / float(quad.subImage.imageRect.extent.height);
+    quad.size.width = quad.size.height * std::clamp(result.screenAspectRatio, 0.25f, 4.0f);
 
     const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad) };
     g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
