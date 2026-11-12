@@ -170,6 +170,10 @@ struct GuestTexture : GuestBaseTexture
     // VR: the surface last resolved into this texture. Unlike sourceSurface it is
     // kept once the copy is done; it is only compared, never dereferenced.
     struct GuestSurface* vrResolvedFrom = nullptr;
+
+    // VR: the last resolve into this texture was carried out as a copy, rather
+    // than dropped with the texture still reading its surface.
+    bool vrResolveCopied = false;
 };
 
 struct GuestLockedRect
@@ -218,6 +222,11 @@ struct GuestSurface : GuestBaseTexture
     ankerl::unordered_dense::map<const RenderTexture*, std::unique_ptr<RenderFramebuffer>> framebuffers;
     RenderSampleCounts sampleCount = RenderSampleCount::COUNT_1;
     ankerl::unordered_dense::set<GuestTexture*> destinationTextures;
+
+    // VR: the left eye's pass saw orthographic draws use this square surface as
+    // their depth (a shadow map), or a perspective camera draw use it.
+    bool vrOrthographicDepth = false;
+    bool vrPerspectiveDepth = false;
 };
 
 enum GuestDeclType

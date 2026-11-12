@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 struct XrSwapchainState
 {
@@ -28,6 +29,34 @@ static bool g_swapchainSrgb;
 
 static uint32_t g_renderWidth = 1920;
 static uint32_t g_renderHeight = 1080;
+
+// A render scale asked for and not applied yet (negative when none).
+static std::atomic<float> g_pendingRenderScale = -1.0f;
+
+// The keep-alive: while the game submits nothing for STALL_TIME (a load, a
+// long hitch, a minimised window), a thread of its own keeps the headset fed
+// with the layer the game submitted last, which the compositor keeps in place
+// in the world. A frame the game has begun meanwhile is ended with that layer
+// too; the game begins a new one when it presents. The swapchains' images are
+// those the game released last.
+static constexpr auto STALL_TIME = std::chrono::milliseconds(100);
+
+struct RetainedLayer
+{
+    VRFrameMode mode = VRFrameMode::None;
+    XrCompositionLayerProjectionView views[2]{};
+    XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+};
+
+static RetainedLayer g_retainedLayer;
+static std::chrono::steady_clock::time_point g_lastGameFrameTime;
+static bool g_keepingAlive;
+static std::chrono::steady_clock::time_point g_keepAliveSince;
+static std::thread g_keepAliveThread;
+static std::atomic<bool> g_keepAliveRunning;
+
+static void StartKeepAlive();
+static void StopKeepAlive();
 static XrSwapchainState g_screenSwapchain;
 static XrSwapchainState g_eyeSwapchains[2];
 
@@ -278,6 +307,14 @@ static void PublishViews()
     g_views = views;
 }
 
+// The per-eye render resolution for a scale of the runtime's recommendation.
+static void GetRenderSize(float scale, uint32_t& width, uint32_t& height)
+{
+    PortVr::OpenXREyeSize size = PortVr::OpenXRScaledEyeSize(g_runtime->ViewConfiguration()[0].properties, std::clamp(scale, 0.25f, 2.0f));
+    width = std::max(64u, size.width & ~1u);
+    height = std::max(64u, size.height & ~1u);
+}
+
 bool VR::Init()
 {
     if (g_runtime != nullptr)
@@ -302,8 +339,7 @@ bool VR::Init()
 
     // One resolution for both eyes: they share the game's render targets.
     const auto& view = g_runtime->ViewConfiguration()[0];
-    g_renderWidth = std::max(64u, view.render_width & ~1u);
-    g_renderHeight = std::max(64u, view.render_height & ~1u);
+    GetRenderSize(config.resolution_scale, g_renderWidth, g_renderHeight);
 
     LOGFN("[VR] Recommended eye resolution {}x{}; rendering at {}x{}.",
         view.properties.recommendedImageRectWidth, view.properties.recommendedImageRectHeight, g_renderWidth, g_renderHeight);
@@ -350,6 +386,7 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
 
     LOGFN("[VR] Session created on '{}' ({}).", g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name);
 
+    StartKeepAlive();
     return true;
 }
 
@@ -360,6 +397,8 @@ bool VR::IsActive()
 
 void VR::Shutdown()
 {
+    StopKeepAlive();
+
     std::lock_guard lock(g_mutex);
 
     if (g_runtime == nullptr)
@@ -378,6 +417,7 @@ void VR::Shutdown()
 
     g_frameBegun = false;
     g_inputFocused = false;
+    g_retainedLayer = {};
     g_runtime->Shutdown();
     g_runtime.reset();
 
@@ -457,6 +497,112 @@ void VR::AcquireImages(VRImages& images)
     images.eyes[1] = AcquireSwapchain(g_eyeSwapchains[1]);
 }
 
+// Ends a frame with a retained layer (or none). g_mutex is held.
+static void EndFrameWithLayer(const PortVr::OpenXRFrame& frame, const RetainedLayer& layer)
+{
+    if (layer.mode == VRFrameMode::None || !frame.should_render)
+    {
+        g_runtime->EndFrameWithoutLayers(frame);
+        return;
+    }
+
+    if (layer.mode == VRFrameMode::Immersive)
+    {
+        XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        projection.space = g_runtime->AppSpace();
+        projection.viewCount = 2;
+        projection.views = layer.views;
+
+        const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection) };
+        g_runtime->EndFrame(frame, layers, uint32_t(std::size(layers)));
+        return;
+    }
+
+    const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer.quad) };
+    g_runtime->EndFrame(frame, layers, uint32_t(std::size(layers)));
+}
+
+static bool AnySwapchainAcquired()
+{
+    return g_screenSwapchain.acquired || g_eyeSwapchains[0].acquired || g_eyeSwapchains[1].acquired;
+}
+
+// One step of the keep-alive thread (see STALL_TIME).
+static void KeepAlive()
+{
+    std::unique_lock lock(g_mutex);
+
+    auto now = std::chrono::steady_clock::now();
+    bool stalled = g_runtime != nullptr && g_runtime->HasSession() && g_retainedLayer.mode != VRFrameMode::None &&
+        !AnySwapchainAcquired() && now - g_lastGameFrameTime >= STALL_TIME;
+
+    if (!stalled)
+    {
+        if (g_keepingAlive)
+        {
+            g_keepingAlive = false;
+            LOGFN("[VR] The game is presenting again after {} ms.",
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - g_keepAliveSince).count());
+        }
+
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
+
+    if (!g_keepingAlive)
+    {
+        g_keepingAlive = true;
+        g_keepAliveSince = now;
+        LOGN("[VR] The game stalled; the headset keeps its last picture.");
+    }
+
+    PortVr::OpenXREventStatus eventStatus = g_runtime->PollEvents();
+    if (eventStatus != PortVr::OpenXREventStatus::Continue || !g_runtime->IsSessionRunning())
+    {
+        g_inputFocused = false;
+        XrInput::Idle();
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return;
+    }
+
+    // A frame the game began before stalling is ended with the old picture.
+    if (g_frameBegun)
+    {
+        g_frameBegun = false;
+        EndFrameWithLayer(g_frame, g_retainedLayer);
+        return;
+    }
+
+    PortVr::OpenXRFrame frame;
+    if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
+        return;
+
+    if (!g_runtime->BeginFrame(frame))
+        return;
+
+    EndFrameWithLayer(frame, g_retainedLayer);
+}
+
+static void StartKeepAlive()
+{
+    g_lastGameFrameTime = std::chrono::steady_clock::now();
+    g_keepAliveRunning = true;
+    g_keepAliveThread = std::thread([]()
+        {
+            while (g_keepAliveRunning)
+                KeepAlive();
+        });
+}
+
+static void StopKeepAlive()
+{
+    g_keepAliveRunning = false;
+    if (g_keepAliveThread.joinable())
+        g_keepAliveThread.join();
+}
+
 bool VR::EndFrame(const VRFrameResult& result)
 {
     std::lock_guard lock(g_mutex);
@@ -485,17 +631,22 @@ bool VR::EndFrame(const VRFrameResult& result)
         g_lastFrameMode = mode;
     }
 
+    g_lastGameFrameTime = std::chrono::steady_clock::now();
+
     if (mode == VRFrameMode::None || !g_frame.should_render)
     {
         g_runtime->EndFrameWithoutLayers(g_frame);
         return true;
     }
 
+    RetainedLayer layer;
+    layer.mode = mode;
+
     if (mode == VRFrameMode::Immersive)
     {
         // Submit the poses the eyes were rendered with, never fresher ones: the
         // compositor reprojects from these to the display time.
-        XrCompositionLayerProjectionView projectionViews[2]{};
+        XrCompositionLayerProjectionView* projectionViews = layer.views;
 
         for (uint32_t i = 0; i < 2; i++)
         {
@@ -510,17 +661,12 @@ bool VR::EndFrame(const VRFrameResult& result)
             view.subImage.imageArrayIndex = 0;
         }
 
-        XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
-        projection.space = g_runtime->AppSpace();
-        projection.viewCount = 2;
-        projection.views = projectionViews;
-
-        const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection) };
-        g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
+        g_retainedLayer = layer;
+        EndFrameWithLayer(g_frame, layer);
         return true;
     }
 
-    XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+    XrCompositionLayerQuad& quad = layer.quad;
     quad.layerFlags = 0;
     quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     quad.subImage.swapchain = g_screenSwapchain.handle;
@@ -547,9 +693,8 @@ bool VR::EndFrame(const VRFrameResult& result)
     quad.size.height = std::max(0.25f, Config::VRScreenWidth.Value) * 9.0f / 16.0f;
     quad.size.width = quad.size.height * std::clamp(result.screenAspectRatio, 0.25f, 4.0f);
 
-    const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad) };
-    g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
-
+    g_retainedLayer = layer;
+    EndFrameWithLayer(g_frame, layer);
     return true;
 }
 
@@ -594,6 +739,57 @@ void VR::UpdateRecenterButtons(bool bothThumbsticksHeld)
 plume::RenderFormat VR::GetImageFormat()
 {
     return g_imageFormat;
+}
+
+void VR::SetRenderScale(float scale)
+{
+    g_pendingRenderScale = scale;
+}
+
+bool VR::IsRenderScalePending()
+{
+    return g_pendingRenderScale.load() > 0.0f;
+}
+
+bool VR::ApplyRenderScale()
+{
+    float scale = g_pendingRenderScale.exchange(-1.0f);
+    if (scale <= 0.0f)
+        return false;
+
+    std::lock_guard lock(g_mutex);
+    if (g_runtime == nullptr || !g_runtime->HasSession() || g_frameBegun)
+        return false;
+
+    uint32_t width, height;
+    GetRenderSize(scale, width, height);
+    if (width == g_renderWidth && height == g_renderHeight)
+        return false;
+
+    // The retained layer names the old swapchains.
+    g_retainedLayer = {};
+
+    for (XrSwapchainState* swapchain : { &g_screenSwapchain, &g_eyeSwapchains[0], &g_eyeSwapchains[1] })
+        DestroySwapchain(*swapchain);
+
+    if (!CreateSwapchain(g_screenSwapchain, width, height, "screen") ||
+        !CreateSwapchain(g_eyeSwapchains[0], width, height, "left eye") ||
+        !CreateSwapchain(g_eyeSwapchains[1], width, height, "right eye"))
+    {
+        // Back to the previous resolution, which the runtime accepted before.
+        for (XrSwapchainState* swapchain : { &g_screenSwapchain, &g_eyeSwapchains[0], &g_eyeSwapchains[1] })
+            DestroySwapchain(*swapchain);
+
+        CreateSwapchain(g_screenSwapchain, g_renderWidth, g_renderHeight, "screen");
+        CreateSwapchain(g_eyeSwapchains[0], g_renderWidth, g_renderHeight, "left eye");
+        CreateSwapchain(g_eyeSwapchains[1], g_renderWidth, g_renderHeight, "right eye");
+        return false;
+    }
+
+    LOGFN("[VR] Rendering at {}x{} per eye (scale {:.2f}).", width, height, scale);
+    g_renderWidth = width;
+    g_renderHeight = height;
+    return true;
 }
 
 uint32_t VR::GetRenderWidth()

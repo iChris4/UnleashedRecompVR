@@ -89,6 +89,7 @@ CONFIG_DEFINE_LOCALISED("VR", int32_t, VRCullingFieldOfView, 110);
 CONFIG_DEFINE_LOCALISED("VR", bool, VRLockRoll, true);
 CONFIG_DEFINE_LOCALISED("VR", bool, VRLockPitch, false);
 CONFIG_DEFINE_LOCALISED("VR", bool, VRCutsceneScreen, true);
+CONFIG_DEFINE("VR", bool, VRReuseShadows, true);
 
 CONFIG_DEFINE_HIDDEN("Codes", bool, AllowCancellingUnleash, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, DisableAutoSaveWarning, false);

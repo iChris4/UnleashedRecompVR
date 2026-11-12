@@ -1016,12 +1016,12 @@ CONFIG_DEFINE_ENUM_LOCALE(EUIAlignmentMode)
 // VR: the options of the VR tab.
 CONFIG_DEFINE_LOCALE(VRRenderScale)
 {
-    { ELanguage::English,  { "Headset Resolution", "Adjust the resolution the game is drawn at for each eye, relative to what the headset recommends.\n\nApplies after restarting the game." } },
-    { ELanguage::Japanese, { "ヘッドセット[解像度:かいぞうど]", "ヘッドセットの\u200B[推奨:すいしょう][解像度:かいぞうど]に\u200B[対:たい]する\u200B[片目:かため]ごとの\u200B[描画解像度:びょうがかいぞうど]を\u200B[調整:ちょうせい]できます\n\nゲームの\u200B[再起動後:さいきどうご]に\u200B[反映:はんえい]されます" } },
-    { ELanguage::German,   { "Headset-Auflösung", "Passe die Auflösung an, mit der das Spiel für jedes Auge dargestellt wird, relativ zur Empfehlung des Headsets.\n\nWird nach einem Neustart des Spiels übernommen." } },
-    { ELanguage::French,   { "Résolution du casque", "Modifie la résolution de rendu de chaque œil, par rapport à celle recommandée par le casque.\n\nPrend effet après le redémarrage du jeu." } },
-    { ELanguage::Spanish,  { "Resolución del visor", "Ajusta la resolución con la que se dibuja el juego para cada ojo, respecto a la recomendada por el visor.\n\nSe aplica al reiniciar el juego." } },
-    { ELanguage::Italian,  { "Risoluzione del visore", "Regola la risoluzione con cui il gioco viene disegnato per ciascun occhio, rispetto a quella consigliata dal visore.\n\nSi applica dopo il riavvio del gioco." } }
+    { ELanguage::English,  { "Headset Resolution", "Adjust the resolution the game is drawn at for each eye, relative to what the headset recommends." } },
+    { ELanguage::Japanese, { "ヘッドセット[解像度:かいぞうど]", "ヘッドセットの\u200B[推奨:すいしょう][解像度:かいぞうど]に\u200B[対:たい]する\u200B[片目:かため]ごとの\u200B[描画解像度:びょうがかいぞうど]を\u200B[調整:ちょうせい]できます" } },
+    { ELanguage::German,   { "Headset-Auflösung", "Passe die Auflösung an, mit der das Spiel für jedes Auge dargestellt wird, relativ zur Empfehlung des Headsets." } },
+    { ELanguage::French,   { "Résolution du casque", "Modifie la résolution de rendu de chaque œil, par rapport à celle recommandée par le casque." } },
+    { ELanguage::Spanish,  { "Resolución del visor", "Ajusta la resolución con la que se dibuja el juego para cada ojo, respecto a la recomendada por el visor." } },
+    { ELanguage::Italian,  { "Risoluzione del visore", "Regola la risoluzione con cui il gioco viene disegnato per ciascun occhio, rispetto a quella consigliata dal visore." } }
 };
 
 CONFIG_DEFINE_LOCALE(VRWorldScale)

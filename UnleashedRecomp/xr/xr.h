@@ -114,6 +114,16 @@ struct VR
     // the game reads it: both thumbsticks held in for a second recentre. Any thread.
     static void UpdateRecenterButtons(bool bothThumbsticksHeld);
 
+    // Asks for the eyes to be drawn at another scale of the runtime's
+    // recommended resolution ([VR] VRRenderScale). Any thread.
+    static void SetRenderScale(float scale);
+    static bool IsRenderScalePending();
+
+    // Replaces the headset images for the scale asked for. Call between frames,
+    // once the GPU is done with the old images. True when the per-eye render
+    // resolution changed: the game's screen must follow.
+    static bool ApplyRenderScale();
+
     // The format the headset images are rendered in before they are copied
     // into the swapchain images, and the per-eye render resolution.
     static plume::RenderFormat GetImageFormat();
@@ -144,6 +154,9 @@ struct VR
     static void GetViews(VRViews& views) { views = {}; }
     static void Recenter() {}
     static void UpdateRecenterButtons(bool) {}
+    static void SetRenderScale(float) {}
+    static bool IsRenderScalePending() { return false; }
+    static bool ApplyRenderScale() { return false; }
     static plume::RenderFormat GetImageFormat() { return plume::RenderFormat::B8G8R8A8_UNORM; }
     static uint32_t GetRenderWidth() { return 1920; }
     static uint32_t GetRenderHeight() { return 1080; }

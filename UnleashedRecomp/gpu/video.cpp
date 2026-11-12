@@ -1226,6 +1226,9 @@ struct VRDrawStatistics
     uint32_t depthOfFieldNeutralised;
     uint32_t cutsceneFrames;
 
+    // Draws, clears and copies of the shadow maps the right eye's pass skipped.
+    uint32_t shadowWorkReused;
+
     // Persistent bloom passes given this frame's bloom for the previous one, the
     // game's persistence factor, and how often the previous one had been
     // resolved from the pass's own target (the feedback loop).
@@ -1599,6 +1602,32 @@ static void LatchVRViews()
 static bool IsVRFrameImmersive()
 {
     return g_vrPass >= 0 && g_vrViews.valid && g_vrCameraDrawCount > 0;
+}
+
+// VR: the shadow maps are drawn for the game camera's frustum, the same for
+// both eyes. They are the square depth surfaces the left eye's pass saw
+// orthographic draws use and no perspective camera draw (the scene's depth
+// buffer has the same format, D3DFMT_D24FS8). Unless [VR] VRReuseShadows is
+// off, the right eye's pass reuses the left eye's: draws and clears into them,
+// with no other target or a dummy one of their size, and copies out of them are
+// skipped, while every state change still runs. A shadow map drawn through one
+// surface several times keeps the copies the left eye's pass made of it; the
+// last one, never copied, is read from the surface (see ProcStretchRect).
+static bool IsVRShadowMap(const GuestSurface* surface)
+{
+    return surface != nullptr && surface->vrOrthographicDepth && !surface->vrPerspectiveDepth;
+}
+
+static bool ShouldReuseVRShadowWork()
+{
+    if (g_vrPass != 1 || !Config::VRReuseShadows || !IsVRShadowMap(g_depthStencil))
+        return false;
+
+    if (g_renderTarget != nullptr && (g_renderTarget->width != g_depthStencil->width || g_renderTarget->height != g_depthStencil->height))
+        return false;
+
+    ++g_vrStatistics.shadowWorkReused;
+    return true;
 }
 
 // Counts a draw into the back buffer left over the whole view of a stereo frame
@@ -2117,6 +2146,9 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
             return g_vrViews.valid ? VRDrawKind::Reflection : VRDrawKind::None;
         }
 
+        if (leftEye && depthStencil != nullptr && depthStencil->guestFormat == D3DFMT_D24FS8 && depthStencil->width == depthStencil->height)
+            depthStencil->vrOrthographicDepth = true;
+
         if (leftEye)
         {
             ++g_vrStatistics.notPerspective;
@@ -2271,12 +2303,12 @@ static void LogVRStatistics()
     LOGFN("[VR] Last 5 s, 2D draws into the back buffer: on the panel {}, full screen {}, left in place {} (last: shader {:016X}, stride {}, position type {:X}, {}). "
         "Boost passes neutralised {}. Bloom feedback replaced {} (persistence {:.3f}, history from its own target {}). "
         "Light shaft passes {} ({} with the light behind the eye; last at {:.3f}, {:.3f}, for the left eye {:.3f}, {:.3f}). "
-        "Depth of field passes neutralised {}. Cutscene frames on the screen {}.",
+        "Depth of field passes neutralised {}. Cutscene frames on the screen {}. Shadow map work reused by the right eye {}.",
         s.twoDOnPanel, s.twoDFullScreen, s.twoDUnhandled, s.lastUnhandledShader, s.lastUnhandledStride,
         s.lastUnhandledPositionType, s.lastUnhandledReason != nullptr ? s.lastUnhandledReason : "-", s.boostPassesNeutralised,
         s.bloomFeedbackReplaced, s.lastBloomPersistence, s.bloomHistoryFromOwnTarget,
         s.lightShaftPasses, s.lightShaftsBehind, s.lastLightShaftGame[0], s.lastLightShaftGame[1],
-        s.lastLightShaftEye[0], s.lastLightShaftEye[1], s.depthOfFieldNeutralised, s.cutsceneFrames);
+        s.lastLightShaftEye[0], s.lastLightShaftEye[1], s.depthOfFieldNeutralised, s.cutsceneFrames, s.shadowWorkReused);
 
     if (s.viewLockedCsd != 0 || s.viewLocked2D != 0 || s.viewLockedBuffer2D != 0 || s.viewLockedOrtho != 0)
     {
@@ -4782,6 +4814,27 @@ void Video::Present()
         g_gpuFrameProfiler.Set(double(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0);
     }
 
+    // VR: a new headset resolution replaces the headset's images once the GPU
+    // is done with the old ones (the render thread waits for BeginCommandList),
+    // and the game's screen follows.
+    if (VR::IsActive() && VR::IsRenderScalePending())
+    {
+        for (size_t i = 0; i < NUM_FRAMES; i++)
+        {
+            if (g_commandListStates[i])
+            {
+                g_queue->waitForCommandFence(g_commandFences[i].get());
+                g_commandListStates[i] = false;
+            }
+        }
+
+        if (VR::ApplyRenderScale())
+        {
+            g_needsResize = true;
+            Video::ComputeViewportDimensions();
+        }
+    }
+
     g_dirtyStates = DirtyStates(true);
     g_uploadAllocators[g_frame].reset();
     g_intermediaryUploadAllocator.reset();
@@ -5443,12 +5496,23 @@ static void ProcStretchRect(const RenderCommand& cmd)
     const bool isDepthStencil = (args.flags & 0x4) != 0;
     const auto surface = isDepthStencil ? g_depthStencil : g_renderTarget;
 
+    // VR: a shadow map texture the left eye's pass copied into keeps that copy.
+    // One still reading its surface (the copy dropped at the end of the frame,
+    // depth being transient) is pointed at it again: the surface still holds
+    // what the left eye's pass drew into it last.
+    if (g_vrPass == 1 && Config::VRReuseShadows && IsVRShadowMap(surface) && args.texture->vrResolveCopied)
+    {
+        ++g_vrStatistics.shadowWorkReused;
+        return;
+    }
+
     // Erase previous pending command so it doesn't cause the texture to be overriden.
     if (args.texture->sourceSurface != nullptr)
         args.texture->sourceSurface->destinationTextures.erase(args.texture);
 
     args.texture->sourceSurface = surface;
     args.texture->vrResolvedFrom = surface;
+    args.texture->vrResolveCopied = false;
     surface->destinationTextures.emplace(args.texture);
 
     // If the texture is assigned to any slots, set it again. This'll also push the barrier.
@@ -5723,6 +5787,7 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                 }
 
                 texture->sourceSurface = nullptr;
+                texture->vrResolveCopied = true;
 
                 // Check if any texture slots had this texture assigned, and make it point back at the original texture.
                 for (uint32_t i = 0; i < std::size(g_textures); i++)
@@ -5851,6 +5916,9 @@ static void Clear(GuestDevice* device, uint32_t flags, uint32_t, be<float>* colo
 static void ProcClear(const RenderCommand& cmd)
 {
     const auto& args = cmd.clear;
+
+    if (ShouldReuseVRShadowWork())
+        return;
 
     if (PopulateBarriersForStretchRect(g_renderTarget, g_depthStencil))
     {
@@ -6736,7 +6804,12 @@ static void FlushRenderStateForRenderThread()
     if (vrDrawKind != VRDrawKind::None)
     {
         if (g_vrPass == 0)
+        {
             ++g_vrCameraDrawCount;
+
+            if (depthStencil != nullptr)
+                depthStencil->vrPerspectiveDepth = true;
+        }
 
         vrVertexPatchShader = g_pipelineState.vertexShader;
 
@@ -6919,6 +6992,9 @@ static void ProcDrawPrimitive(const RenderCommand& cmd)
         UnsetInstancingStream();
     }
 
+    if (ShouldReuseVRShadowWork())
+        return;
+
     FlushRenderStateForRenderThread();
 
     auto& commandList = g_commandLists[g_frame];
@@ -6953,6 +7029,10 @@ static void ProcDrawIndexedPrimitive(const RenderCommand& cmd)
         UnsetInstancingStream();
 
     SetPrimitiveType(args.primitiveType);
+
+    if (ShouldReuseVRShadowWork())
+        return;
+
     FlushRenderStateForRenderThread();
 
     g_commandLists[g_frame]->drawIndexedInstanced(args.primCount, 1, args.startIndex, args.baseVertexIndex, 0);
@@ -7023,6 +7103,9 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
         if (viewLocked)
             NoteVRViewLocked(g_vrStatistics.viewLockedCsd, "untextured CSD covering the canvas");
     }
+
+    if (ShouldReuseVRShadowWork())
+        return;
 
     g_vrDrawIsUP = true;
     FlushRenderStateForRenderThread();
@@ -9919,6 +10002,10 @@ SDLEventListenerForPSOCaching g_sdlEventListenerForPSOCaching;
 
 void VideoConfigValueChangedCallback(IConfigDef* config)
 {
+    // VR: the headset images are replaced between frames (see Video::Present).
+    if (config == &Config::VRRenderScale)
+        VR::SetRenderScale(Config::VRRenderScale);
+
     // Config options that require internal resolution resize
     g_needsResize |=
         config == &Config::AspectRatio ||
