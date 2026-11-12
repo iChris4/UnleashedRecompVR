@@ -59,7 +59,7 @@ static constexpr float PADDING_NARROW_GRID_COUNT = 1.0f;
 
 static constexpr float INFO_TEXT_MARQUEE_DELAY = 1.2f;
 
-static constexpr int32_t g_categoryCount = 4;
+static constexpr int32_t g_categoryCount = 5;
 static int32_t g_categoryIndex;
 static ImVec2 g_categoryAnimMin;
 static ImVec2 g_categoryAnimMax;
@@ -423,6 +423,7 @@ static std::string& GetCategory(int index)
         case 1: return Localise("Options_Category_Input");
         case 2: return Localise("Options_Category_Audio");
         case 3: return Localise("Options_Category_Video");
+        case 4: return Localise("Options_Category_VR");
     }
 
     return g_localeMissing;
@@ -1121,7 +1122,14 @@ static void DrawConfigOption(int32_t rowIndex, float yOffset, ConfigDef<T>* conf
     std::string valueText;
     if constexpr (std::is_same_v<T, float>)
     {
-        valueText = fmt::format("{}%", int32_t(round(config->Value * 100.0f)));
+        // VR: distances and sizes in metres.
+        bool isMetres = config == &Config::VRHudDistance || config == &Config::VRHudWidth ||
+            config == &Config::VRScreenDistance || config == &Config::VRScreenWidth;
+
+        if (isMetres)
+            valueText = fmt::format("{:.2f} m", config->Value);
+        else
+            valueText = fmt::format("{}%", int32_t(round(config->Value * 100.0f)));
     }
     else if constexpr (std::is_same_v<T, int32_t>)
     {
@@ -1151,6 +1159,10 @@ static void DrawConfigOption(int32_t rowIndex, float yOffset, ConfigDef<T>* conf
         else if (config == &Config::Monitor)
         {
             valueText = fmt::format("{}", config->Value + 1);
+        }
+        else if (config == &Config::VRCullingFieldOfView)
+        {
+            valueText = fmt::format("{}\u00B0", config->Value);
         }
         else
         {
@@ -1285,6 +1297,22 @@ static void DrawConfigOptions()
 
             break;
         }
+
+        case 4: // VR
+            DrawConfigOption(rowCount++, yOffset, &Config::VRRenderScale, true, nullptr, 0.3f, 1.0f, 1.5f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRWorldScale, true, nullptr, 0.25f, 1.0f, 4.0f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRHudDistance, true, nullptr, 0.5f, 1.5f, 5.0f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRHudWidth, true, nullptr, 0.4f, 1.4f, 4.0f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRScreenDistance, true, nullptr, 0.5f, 2.5f, 10.0f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRScreenWidth, true, nullptr, 0.5f, 3.0f, 10.0f);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRLockRoll, true);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRLockPitch, true);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRCullingFieldOfView, true, nullptr, 60, 110, 170);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRCutsceneScreen, true);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRDepthOfField, true);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRBoostFilter, true);
+            DrawConfigOption(rowCount++, yOffset, &Config::VRBloomPersistence, true);
+            break;
     }
 
     auto inputState = SWA::CInputState::GetInstance();

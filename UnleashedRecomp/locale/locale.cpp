@@ -105,6 +105,17 @@ std::unordered_map<std::string_view, std::unordered_map<ELanguage, std::string>>
         }
     },
     {
+        "Options_Category_VR",
+        {
+            { ELanguage::English,  "VR" },
+            { ELanguage::Japanese, "VR" },
+            { ELanguage::German,   "VR" },
+            { ELanguage::French,   "VR" },
+            { ELanguage::Spanish,  "VR" },
+            { ELanguage::Italian,  "VR" }
+        }
+    },
+    {
         // Notes: integer values in the options menu (e.g. FPS) when at their maximum value.
         "Options_Value_Max",
         {

@@ -100,7 +100,7 @@ void CameraFieldOfViewMidAsmHook(PPCRegister& r31, PPCRegister& f31)
     // which MapVRScreenPosition undoes for the HUD markers.
     if (IsVRFramingActive())
     {
-        float cullingFieldOfView = std::clamp(Config::VRCullingFieldOfView.Value, 10.0f, 170.0f) * float(M_PI) / 180.0f;
+        float cullingFieldOfView = float(std::clamp(Config::VRCullingFieldOfView.Value, 10, 170)) * float(M_PI) / 180.0f;
         fieldOfView = std::max(fieldOfView, cullingFieldOfView);
     }
 

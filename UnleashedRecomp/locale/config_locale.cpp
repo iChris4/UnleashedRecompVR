@@ -1012,3 +1012,134 @@ CONFIG_DEFINE_ENUM_LOCALE(EUIAlignmentMode)
         }
     }
 };
+
+// VR: the options of the VR tab.
+CONFIG_DEFINE_LOCALE(VRRenderScale)
+{
+    { ELanguage::English,  { "Headset Resolution", "Adjust the resolution the game is drawn at for each eye, relative to what the headset recommends.\n\nApplies after restarting the game." } },
+    { ELanguage::Japanese, { "ヘッドセット[解像度:かいぞうど]", "ヘッドセットの\u200B[推奨:すいしょう][解像度:かいぞうど]に\u200B[対:たい]する\u200B[片目:かため]ごとの\u200B[描画解像度:びょうがかいぞうど]を\u200B[調整:ちょうせい]できます\n\nゲームの\u200B[再起動後:さいきどうご]に\u200B[反映:はんえい]されます" } },
+    { ELanguage::German,   { "Headset-Auflösung", "Passe die Auflösung an, mit der das Spiel für jedes Auge dargestellt wird, relativ zur Empfehlung des Headsets.\n\nWird nach einem Neustart des Spiels übernommen." } },
+    { ELanguage::French,   { "Résolution du casque", "Modifie la résolution de rendu de chaque œil, par rapport à celle recommandée par le casque.\n\nPrend effet après le redémarrage du jeu." } },
+    { ELanguage::Spanish,  { "Resolución del visor", "Ajusta la resolución con la que se dibuja el juego para cada ojo, respecto a la recomendada por el visor.\n\nSe aplica al reiniciar el juego." } },
+    { ELanguage::Italian,  { "Risoluzione del visore", "Regola la risoluzione con cui il gioco viene disegnato per ciascun occhio, rispetto a quella consigliata dal visore.\n\nSi applica dopo il riavvio del gioco." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRWorldScale)
+{
+    { ELanguage::English,  { "World Scale", "Adjust how large the world feels. Higher values make it look smaller." } },
+    { ELanguage::Japanese, { "ワールドスケール", "[世界:せかい]の\u200B[大:おお]きさの\u200B[感:かん]じ[方:かた]を\u200B[調整:ちょうせい]できます\n[値:あたい]を\u200B[上:あ]げると\u200B[世界:せかい]が\u200B[小:ちい]さく\u200B[見:み]えます" } },
+    { ELanguage::German,   { "Weltmaßstab", "Passe an, wie groß sich die Welt anfühlt. Höhere Werte lassen sie kleiner wirken." } },
+    { ELanguage::French,   { "Échelle du monde", "Modifie la taille ressentie du monde. Une valeur plus élevée le fait paraître plus petit." } },
+    { ELanguage::Spanish,  { "Escala del mundo", "Ajusta lo grande que se siente el mundo. Los valores más altos lo hacen parecer más pequeño." } },
+    { ELanguage::Italian,  { "Scala del mondo", "Regola quanto appare grande il mondo. Valori più alti lo fanno sembrare più piccolo." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRHudDistance)
+{
+    { ELanguage::English,  { "HUD Distance", "Adjust how far away the HUD panel floats." } },
+    { ELanguage::Japanese, { "HUDの[距離:きょり]", "HUDパネルの\u200B[表示:ひょうじ][距離:きょり]を\u200B[調整:ちょうせい]できます" } },
+    { ELanguage::German,   { "HUD-Entfernung", "Passe an, wie weit entfernt die HUD-Tafel schwebt." } },
+    { ELanguage::French,   { "Distance de l'interface", "Modifie la distance à laquelle flotte le panneau de l'interface." } },
+    { ELanguage::Spanish,  { "Distancia de la interfaz", "Ajusta a qué distancia flota el panel de la interfaz." } },
+    { ELanguage::Italian,  { "Distanza interfaccia", "Regola la distanza a cui fluttua il pannello dell'interfaccia." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRHudWidth)
+{
+    { ELanguage::English,  { "HUD Size", "Adjust the width of the HUD panel." } },
+    { ELanguage::Japanese, { "HUDの[大:おお]きさ", "HUDパネルの\u200B[幅:はば]を\u200B[調整:ちょうせい]できます" } },
+    { ELanguage::German,   { "HUD-Größe", "Passe die Breite der HUD-Tafel an." } },
+    { ELanguage::French,   { "Taille de l'interface", "Modifie la largeur du panneau de l'interface." } },
+    { ELanguage::Spanish,  { "Tamaño de la interfaz", "Ajusta el ancho del panel de la interfaz." } },
+    { ELanguage::Italian,  { "Dimensione interfaccia", "Regola la larghezza del pannello dell'interfaccia." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRScreenDistance)
+{
+    { ELanguage::English,  { "Screen Distance", "Adjust how far away the floating screen for menus, loading screens, movies and cutscenes is placed." } },
+    { ELanguage::Japanese, { "スクリーンの[距離:きょり]", "メニュー、\u200Bロード[画面:がめん]、\u200Bムービー、\u200Bカットシーンを\u200B[映:うつ]す\u200Bスクリーンの\u200B[距離:きょり]を\u200B[調整:ちょうせい]できます" } },
+    { ELanguage::German,   { "Bildschirmentfernung", "Passe an, wie weit entfernt der schwebende Bildschirm für Menüs, Ladebildschirme, Videos und Zwischensequenzen steht." } },
+    { ELanguage::French,   { "Distance de l'écran", "Modifie la distance de l'écran flottant utilisé pour les menus, les chargements, les vidéos et les cinématiques." } },
+    { ELanguage::Spanish,  { "Distancia de la pantalla", "Ajusta a qué distancia se coloca la pantalla flotante de los menús, las pantallas de carga, los vídeos y las cinemáticas." } },
+    { ELanguage::Italian,  { "Distanza schermo", "Regola la distanza dello schermo fluttuante usato per menu, caricamenti, filmati e scene d'intermezzo." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRScreenWidth)
+{
+    { ELanguage::English,  { "Screen Size", "Adjust the width of the floating screen." } },
+    { ELanguage::Japanese, { "スクリーンの[大:おお]きさ", "スクリーンの\u200B[幅:はば]を\u200B[調整:ちょうせい]できます" } },
+    { ELanguage::German,   { "Bildschirmgröße", "Passe die Breite des schwebenden Bildschirms an." } },
+    { ELanguage::French,   { "Taille de l'écran", "Modifie la largeur de l'écran flottant." } },
+    { ELanguage::Spanish,  { "Tamaño de la pantalla", "Ajusta el ancho de la pantalla flotante." } },
+    { ELanguage::Italian,  { "Dimensione schermo", "Regola la larghezza dello schermo fluttuante." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRLockRoll)
+{
+    { ELanguage::English,  { "Level Horizon", "Keep the horizon level when the camera tilts sideways. Only your head tilts the view." } },
+    { ELanguage::Japanese, { "[水平線:すいへいせん]の[固定:こてい]", "カメラが\u200B[横:よこ]に\u200B[傾:かたむ]いても\u200B[水平線:すいへいせん]を\u200B[水平:すいへい]に\u200B[保:たも]ちます" } },
+    { ELanguage::German,   { "Horizont ausrichten", "Hält den Horizont gerade, wenn die Kamera seitlich kippt. Nur dein Kopf neigt die Ansicht." } },
+    { ELanguage::French,   { "Horizon stable", "Garde l'horizon droit quand la caméra s'incline sur le côté. Seule votre tête incline la vue." } },
+    { ELanguage::Spanish,  { "Horizonte nivelado", "Mantiene el horizonte nivelado cuando la cámara se inclina hacia un lado. Solo tu cabeza inclina la vista." } },
+    { ELanguage::Italian,  { "Orizzonte livellato", "Mantiene l'orizzonte dritto quando la telecamera si inclina di lato. Solo la tua testa inclina la visuale." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRLockPitch)
+{
+    { ELanguage::English,  { "Lock Camera Pitch", "Keep the camera from looking up or down. Look up and down with your head instead." } },
+    { ELanguage::Japanese, { "カメラの[上下固定:じょうげこてい]", "カメラが\u200B[上下:じょうげ]を\u200B[向:む]かないように\u200Bします\n[頭:あたま]を\u200B[動:うご]かして\u200B[上下:じょうげ]を\u200B[見:み]ます" } },
+    { ELanguage::German,   { "Kameraneigung sperren", "Verhindert, dass die Kamera nach oben oder unten schaut. Schaue stattdessen mit dem Kopf nach oben oder unten." } },
+    { ELanguage::French,   { "Bloquer l'inclinaison", "Empêche la caméra de regarder vers le haut ou le bas. Regardez plutôt avec votre tête." } },
+    { ELanguage::Spanish,  { "Bloquear inclinación", "Evita que la cámara mire hacia arriba o hacia abajo. Mira arriba y abajo con la cabeza." } },
+    { ELanguage::Italian,  { "Blocca inclinazione", "Impedisce alla telecamera di guardare in alto o in basso. Guarda in alto e in basso con la testa." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRCullingFieldOfView)
+{
+    { ELanguage::English,  { "Culling Field of View", "Adjust how wide the game looks around its camera when deciding what to draw. Higher values stop objects popping in at the edges of your view, but may soften shadows." } },
+    { ELanguage::Japanese, { "[描画範囲:びょうがはんい]", "[描画:びょうが]する\u200Bオブジェクトを\u200B[判定:はんてい]する\u200B[視野角:しやかく]を\u200B[調整:ちょうせい]できます\n[値:あたい]を\u200B[上:あ]げると\u200B[視界:しかい]の\u200B[端:はし]で\u200Bオブジェクトが\u200B[急:きゅう]に\u200B[現:あらわ]れにくく\u200Bなりますが、\u200B[影:かげ]が\u200Bぼやける\u200B[場合:ばあい]が\u200Bあります" } },
+    { ELanguage::German,   { "Sichtfeld fürs Zeichnen", "Passe an, wie weit das Spiel um die Kamera herum schaut, um zu entscheiden, was gezeichnet wird. Höhere Werte verhindern, dass Objekte am Rand deiner Sicht auftauchen, können aber Schatten weicher machen." } },
+    { ELanguage::French,   { "Champ d'affichage", "Modifie l'angle dans lequel le jeu affiche les objets autour de sa caméra. Une valeur plus élevée évite que des objets apparaissent soudainement au bord de votre vue, mais peut adoucir les ombres." } },
+    { ELanguage::Spanish,  { "Campo de dibujado", "Ajusta la amplitud con la que el juego decide qué dibujar alrededor de su cámara. Los valores altos evitan que aparezcan objetos de golpe en los bordes de tu vista, pero pueden suavizar las sombras." } },
+    { ELanguage::Italian,  { "Campo di disegno", "Regola l'ampiezza con cui il gioco decide cosa disegnare attorno alla telecamera. Valori più alti evitano che gli oggetti compaiano all'improvviso ai bordi della visuale, ma possono ammorbidire le ombre." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRCutsceneScreen)
+{
+    { ELanguage::English,  { "Cutscenes on Screen", "Play cutscenes on the floating screen instead of around you." } },
+    { ELanguage::Japanese, { "スクリーンで[再生:さいせい]", "カットシーンを\u200B[周囲:しゅうい]ではなく\u200Bスクリーンで\u200B[再生:さいせい]します" } },
+    { ELanguage::German,   { "Sequenzen auf Bildschirm", "Spielt Zwischensequenzen auf dem schwebenden Bildschirm statt um dich herum ab." } },
+    { ELanguage::French,   { "Cinématiques sur écran", "Affiche les cinématiques sur l'écran flottant plutôt qu'autour de vous." } },
+    { ELanguage::Spanish,  { "Cinemáticas en pantalla", "Reproduce las cinemáticas en la pantalla flotante en lugar de a tu alrededor." } },
+    { ELanguage::Italian,  { "Intermezzi su schermo", "Riproduce le scene d'intermezzo sullo schermo fluttuante invece che attorno a te." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRDepthOfField)
+{
+    { ELanguage::English,  { "Depth of Field", "Blur the parts of the scene the game's camera is not focused on. The focus follows the game's camera, not where you look." } },
+    { ELanguage::Japanese, { "[被写界深度:ひしゃかいしんど]", "カメラの\u200Bピントが\u200B[合:あ]っていない\u200B[部分:ぶぶん]を\u200Bぼかします\nピントは\u200B[視線:しせん]ではなく\u200Bゲームのカメラに\u200B[従:したが]います" } },
+    { ELanguage::German,   { "Tiefenschärfe", "Verwischt die Bereiche, auf die die Spielkamera nicht fokussiert. Der Fokus folgt der Spielkamera, nicht deinem Blick." } },
+    { ELanguage::French,   { "Profondeur de champ", "Floute les zones sur lesquelles la caméra du jeu n'est pas mise au point. La mise au point suit la caméra du jeu, pas votre regard." } },
+    { ELanguage::Spanish,  { "Profundidad de campo", "Desenfoca las zonas en las que no enfoca la cámara del juego. El enfoque sigue a la cámara del juego, no a tu mirada." } },
+    { ELanguage::Italian,  { "Profondità di campo", "Sfoca le zone su cui la telecamera del gioco non è a fuoco. La messa a fuoco segue la telecamera del gioco, non il tuo sguardo." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRBoostFilter)
+{
+    { ELanguage::English,  { "Boost Effects", "Show the screen distortion and blur while boosting." } },
+    { ELanguage::Japanese, { "ブーストエフェクト", "ブースト[中:ちゅう]の\u200B[画面:がめん]の\u200B[歪:ゆが]みと\u200Bぼかしを\u200B[表示:ひょうじ]します" } },
+    { ELanguage::German,   { "Boost-Effekte", "Zeigt die Bildverzerrung und Unschärfe beim Boosten." } },
+    { ELanguage::French,   { "Effets de Boost", "Affiche la distorsion et le flou de l'écran pendant le Boost." } },
+    { ELanguage::Spanish,  { "Efectos de Boost", "Muestra la distorsión y el desenfoque de la pantalla al usar el Boost." } },
+    { ELanguage::Italian,  { "Effetti Boost", "Mostra la distorsione e la sfocatura dello schermo durante il Boost." } }
+};
+
+CONFIG_DEFINE_LOCALE(VRBloomPersistence)
+{
+    { ELanguage::English,  { "Bloom Trails", "Let the glow around bright lights linger from frame to frame. In a headset it trails behind head movements." } },
+    { ELanguage::Japanese, { "ブルームの[残像:ざんぞう]", "[明:あか]るい\u200B[光:ひかり]の\u200B[周:まわ]りの\u200B[輝:かがや]きを\u200B[残:のこ]します\nヘッドセットでは\u200B[頭:あたま]の\u200B[動:うご]きに\u200B[遅:おく]れて\u200B[見:み]えます" } },
+    { ELanguage::German,   { "Bloom-Nachzieheffekt", "Lässt das Leuchten um helle Lichter von Bild zu Bild nachwirken. Im Headset zieht es bei Kopfbewegungen hinterher." } },
+    { ELanguage::French,   { "Traînées lumineuses", "Fait persister la lueur autour des lumières vives d'une image à l'autre. Dans un casque, elle traîne derrière les mouvements de la tête." } },
+    { ELanguage::Spanish,  { "Estela del resplandor", "Hace que el brillo alrededor de las luces intensas perdure entre fotogramas. En un visor deja una estela al mover la cabeza." } },
+    { ELanguage::Italian,  { "Scia del bagliore", "Fa persistere il bagliore attorno alle luci intense da un fotogramma all'altro. In un visore lascia una scia durante i movimenti della testa." } }
+};

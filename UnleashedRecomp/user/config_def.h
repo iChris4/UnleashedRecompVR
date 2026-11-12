@@ -76,19 +76,19 @@ CONFIG_DEFINE_ENUM_LOCALISED("Video", ECutsceneAspectRatio, CutsceneAspectRatio,
 CONFIG_DEFINE_ENUM_LOCALISED("Video", EUIAlignmentMode, UIAlignmentMode, EUIAlignmentMode::Edge);
 
 CONFIG_DEFINE("VR", bool, VREnabled, false);
-CONFIG_DEFINE("VR", float, VRRenderScale, 1.0f);
-CONFIG_DEFINE("VR", float, VRWorldScale, 1.0f);
-CONFIG_DEFINE("VR", float, VRScreenDistance, 2.5f);
-CONFIG_DEFINE("VR", float, VRScreenWidth, 3.0f);
-CONFIG_DEFINE("VR", float, VRHudDistance, 1.5f);
-CONFIG_DEFINE("VR", float, VRHudWidth, 1.4f);
-CONFIG_DEFINE("VR", bool, VRBoostFilter, false);
-CONFIG_DEFINE("VR", bool, VRBloomPersistence, false);
-CONFIG_DEFINE("VR", bool, VRDepthOfField, false);
-CONFIG_DEFINE("VR", float, VRCullingFieldOfView, 110.0f);
-CONFIG_DEFINE("VR", bool, VRLockRoll, true);
-CONFIG_DEFINE("VR", bool, VRLockPitch, false);
-CONFIG_DEFINE("VR", bool, VRCutsceneScreen, true);
+CONFIG_DEFINE_LOCALISED("VR", float, VRRenderScale, 1.0f);
+CONFIG_DEFINE_LOCALISED("VR", float, VRWorldScale, 1.0f);
+CONFIG_DEFINE_LOCALISED("VR", float, VRScreenDistance, 2.5f);
+CONFIG_DEFINE_LOCALISED("VR", float, VRScreenWidth, 3.0f);
+CONFIG_DEFINE_LOCALISED("VR", float, VRHudDistance, 1.5f);
+CONFIG_DEFINE_LOCALISED("VR", float, VRHudWidth, 1.4f);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRBoostFilter, false);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRBloomPersistence, false);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRDepthOfField, false);
+CONFIG_DEFINE_LOCALISED("VR", int32_t, VRCullingFieldOfView, 110);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRLockRoll, true);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRLockPitch, false);
+CONFIG_DEFINE_LOCALISED("VR", bool, VRCutsceneScreen, true);
 
 CONFIG_DEFINE_HIDDEN("Codes", bool, AllowCancellingUnleash, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, DisableAutoSaveWarning, false);
