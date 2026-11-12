@@ -1694,13 +1694,14 @@ static bool IsVRFrameImmersive()
 
 // VR: the shadow maps are drawn for the game camera's frustum, the same for
 // both eyes. They are the square depth surfaces the left eye's pass saw
-// orthographic draws use and no perspective camera draw (the scene's depth
-// buffer has the same format, D3DFMT_D24FS8). Unless [VR] VRReuseShadows is
-// off, the right eye's pass reuses the left eye's: draws and clears into them,
-// with no other target or a dummy one of their size, and copies out of them are
-// skipped, while every state change still runs. A shadow map drawn through one
-// surface several times keeps the copies the left eye's pass made of it; the
-// last one, never copied, is read from the surface (see ProcStretchRect).
+// orthographic draws use and no perspective camera draw. There are two: one
+// D3DFMT_D24FS8 like the scene's depth buffer, one D3DFMT_D24S8. Unless [VR]
+// VRReuseShadows is off, the right eye's pass reuses the left eye's: draws and
+// clears into them, with no other target or a dummy one of their size, and
+// copies out of them are skipped, while every state change still runs. A shadow
+// map drawn through one surface several times keeps the copies the left eye's
+// pass made of it; the last one, never copied, is read from the surface (see
+// ProcStretchRect).
 static bool IsVRShadowMap(const GuestSurface* surface)
 {
     return surface != nullptr && surface->vrOrthographicDepth && !surface->vrPerspectiveDepth;
@@ -2234,8 +2235,11 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
             return g_vrViews.valid ? VRDrawKind::Reflection : VRDrawKind::None;
         }
 
-        if (leftEye && depthStencil != nullptr && depthStencil->guestFormat == D3DFMT_D24FS8 && depthStencil->width == depthStencil->height)
+        if (leftEye && depthStencil != nullptr && depthStencil->width == depthStencil->height &&
+            (depthStencil->guestFormat == D3DFMT_D24FS8 || depthStencil->guestFormat == D3DFMT_D24S8))
+        {
             depthStencil->vrOrthographicDepth = true;
+        }
 
         if (leftEye)
         {
