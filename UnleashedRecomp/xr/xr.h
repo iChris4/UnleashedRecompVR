@@ -74,11 +74,13 @@ struct VR
 
 #ifdef UNLEASHED_RECOMP_OPENXR
     // Creates the OpenXR instance and finds the headset. False keeps the game flat.
-    static bool Init();
+    // vulkan picks the graphics API the session will use (D3D12 otherwise).
+    static bool Init(bool vulkan);
     static bool IsInitialized();
 
     // The adapter the runtime renders on, as plume's preferred device name.
-    static std::string GetAdapterName();
+    // For Vulkan, the name is only known once plume's Vulkan instance exists.
+    static std::string GetAdapterName(plume::RenderInterface* renderInterface);
 
     // Creates the session and its swapchains on the game's device and queue.
     static bool CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* queue);
@@ -142,9 +144,9 @@ struct VR
     static void SetRumble(uint16_t leftMotorSpeed, uint16_t rightMotorSpeed);
 #else
     // Builds without OpenXR: VR is never active.
-    static bool Init() { return false; }
+    static bool Init(bool) { return false; }
     static bool IsInitialized() { return false; }
-    static std::string GetAdapterName() { return {}; }
+    static std::string GetAdapterName(plume::RenderInterface*) { return {}; }
     static bool CreateSession(plume::RenderDevice*, plume::RenderCommandQueue*) { return false; }
     static bool IsActive() { return false; }
     static void Shutdown() {}

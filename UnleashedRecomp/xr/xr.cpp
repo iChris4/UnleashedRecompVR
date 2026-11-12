@@ -1,5 +1,6 @@
 #include "xr.h"
 #include "xr_d3d12.h"
+#include "xr_vulkan.h"
 #include "xr_input.h"
 
 #include <vr/openxr_runtime.h>
@@ -22,6 +23,18 @@ struct XrSwapchainState
 
 static std::unique_ptr<PortVr::OpenXRRuntime> g_runtime;
 static std::mutex g_mutex;
+
+// The graphics API of the session (XR_KHR_vulkan_enable or XR_KHR_D3D12_enable),
+// and the device the swapchain images are wrapped for.
+static bool g_vulkanBackend;
+static plume::RenderDevice* g_renderDevice;
+
+// With Vulkan the runtime may use the session's queue in frame and swapchain
+// calls, which must not overlap the render thread's submissions.
+static std::unique_lock<std::mutex> LockGraphicsQueue()
+{
+    return g_vulkanBackend ? XrVulkan::LockQueue() : std::unique_lock<std::mutex>();
+}
 
 static int64_t g_swapchainFormat;
 static plume::RenderFormat g_imageFormat = plume::RenderFormat::B8G8R8A8_UNORM;
@@ -109,7 +122,10 @@ static void DestroySwapchain(XrSwapchainState& swapchain)
     swapchain.images.clear();
 
     if (swapchain.handle != XR_NULL_HANDLE)
+    {
+        auto queueLock = LockGraphicsQueue();
         xrDestroySwapchain(swapchain.handle);
+    }
 
     swapchain = {};
 }
@@ -129,7 +145,12 @@ static bool CreateSwapchain(XrSwapchainState& swapchain, uint32_t width, uint32_
     createInfo.arraySize = 1;
     createInfo.mipCount = 1;
 
-    XrResult result = xrCreateSwapchain(g_runtime->Session(), &createInfo, &swapchain.handle);
+    XrResult result;
+    {
+        auto queueLock = LockGraphicsQueue();
+        result = xrCreateSwapchain(g_runtime->Session(), &createInfo, &swapchain.handle);
+    }
+
     g_runtime->ObserveResult(result);
     if (XR_FAILED(result))
     {
@@ -141,7 +162,9 @@ static bool CreateSwapchain(XrSwapchainState& swapchain, uint32_t width, uint32_
     swapchain.width = width;
     swapchain.height = height;
 
-    result = XrD3D12::EnumerateSwapchainImages(swapchain.handle, width, height, g_imageFormat, swapchain.images);
+    result = g_vulkanBackend ?
+        XrVulkan::EnumerateSwapchainImages(swapchain.handle, width, height, g_imageFormat, g_renderDevice, swapchain.images) :
+        XrD3D12::EnumerateSwapchainImages(swapchain.handle, width, height, g_imageFormat, swapchain.images);
     g_runtime->ObserveResult(result);
     if (XR_FAILED(result))
     {
@@ -158,6 +181,8 @@ static plume::RenderTexture* AcquireSwapchain(XrSwapchainState& swapchain)
 {
     if (swapchain.acquired)
         return swapchain.images[swapchain.acquiredIndex].get();
+
+    auto queueLock = LockGraphicsQueue();
 
     XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     XrResult result = xrAcquireSwapchainImage(swapchain.handle, &acquireInfo, &swapchain.acquiredIndex);
@@ -189,6 +214,8 @@ static bool ReleaseSwapchain(XrSwapchainState& swapchain)
 {
     if (!swapchain.acquired)
         return false;
+
+    auto queueLock = LockGraphicsQueue();
 
     XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     XrResult result = xrReleaseSwapchainImage(swapchain.handle, &releaseInfo);
@@ -315,22 +342,27 @@ static void GetRenderSize(float scale, uint32_t& width, uint32_t& height)
     height = std::max(64u, size.height & ~1u);
 }
 
-bool VR::Init()
+bool VR::Init(bool vulkan)
 {
     if (g_runtime != nullptr)
         return true;
+
+    g_vulkanBackend = vulkan;
 
     PortVr::OpenXRConfig config;
     config.application_name = "Unleashed Recompiled";
     config.engine_name = "UnleashedRecomp";
     config.reference_space = XR_REFERENCE_SPACE_TYPE_LOCAL;
-    config.required_extensions = { XrD3D12::EXTENSION_NAME };
+    config.required_extensions = { vulkan ? XrVulkan::EXTENSION_NAME : XrD3D12::EXTENSION_NAME };
     config.optional_extensions = { "XR_KHR_win32_convert_performance_counter_time" };
     config.resolution_scale = std::clamp(Config::VRRenderScale.Value, 0.25f, 2.0f);
 
     g_runtime = std::make_unique<PortVr::OpenXRRuntime>(LogOpenXR);
 
-    if (!g_runtime->Initialize(config) || !XrD3D12::QueryGraphicsRequirements(*g_runtime))
+    bool prepared = g_runtime->Initialize(config) &&
+        (vulkan ? XrVulkan::Prepare(*g_runtime) : XrD3D12::QueryGraphicsRequirements(*g_runtime));
+
+    if (!prepared)
     {
         LOGN_WARNING("[VR] OpenXR is unavailable; the game will run without VR.");
         g_runtime.reset();
@@ -352,9 +384,12 @@ bool VR::IsInitialized()
     return g_runtime != nullptr;
 }
 
-std::string VR::GetAdapterName()
+std::string VR::GetAdapterName(plume::RenderInterface* renderInterface)
 {
-    return XrD3D12::GetAdapterName();
+    if (g_runtime == nullptr)
+        return {};
+
+    return g_vulkanBackend ? XrVulkan::GetDeviceName(*g_runtime, renderInterface) : XrD3D12::GetAdapterName();
 }
 
 bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* queue)
@@ -362,16 +397,30 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
     if (g_runtime == nullptr)
         return false;
 
-    if (!XrD3D12::IsDeviceOnRequiredAdapter(device))
+    bool onRequiredDevice = g_vulkanBackend ? XrVulkan::IsDeviceOnRequiredGpu(*g_runtime, device) : XrD3D12::IsDeviceOnRequiredAdapter(device);
+    if (!onRequiredDevice)
     {
-        LOGN_ERROR("[VR] The D3D12 device is not on the adapter the OpenXR runtime requires.");
+        LOGFN_ERROR("[VR] The {} device is not on the GPU the OpenXR runtime requires.", g_vulkanBackend ? "Vulkan" : "D3D12");
         return false;
     }
 
-    if (!g_runtime->CreateSession(XrD3D12::GetGraphicsBinding(device, queue)))
+    g_renderDevice = device;
+
+    const void* binding = g_vulkanBackend ? XrVulkan::GetGraphicsBinding(device, queue) : XrD3D12::GetGraphicsBinding(device, queue);
+    bool sessionCreated;
+    {
+        auto queueLock = LockGraphicsQueue();
+        sessionCreated = g_runtime->CreateSession(binding);
+    }
+
+    if (!sessionCreated)
         return false;
 
-    if (!XrD3D12::SelectSwapchainFormat(g_runtime->SwapchainFormats(), g_swapchainFormat, g_imageFormat, g_swapchainSrgb))
+    bool formatSelected = g_vulkanBackend ?
+        XrVulkan::SelectSwapchainFormat(g_runtime->SwapchainFormats(), g_swapchainFormat, g_imageFormat, g_swapchainSrgb) :
+        XrD3D12::SelectSwapchainFormat(g_runtime->SwapchainFormats(), g_swapchainFormat, g_imageFormat, g_swapchainSrgb);
+
+    if (!formatSelected)
         return false;
 
     if (!CreateSwapchain(g_screenSwapchain, g_renderWidth, g_renderHeight, "screen") ||
@@ -384,7 +433,8 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
     if (!XrInput::Create(*g_runtime))
         LOGN_WARNING("[VR] Motion controllers are unavailable; use a gamepad or the keyboard.");
 
-    LOGFN("[VR] Session created on '{}' ({}).", g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name);
+    LOGFN("[VR] Session created on '{}' ({}, {}).", g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name,
+        g_vulkanBackend ? "Vulkan" : "D3D12");
 
     StartKeepAlive();
     return true;
@@ -418,7 +468,12 @@ void VR::Shutdown()
     g_frameBegun = false;
     g_inputFocused = false;
     g_retainedLayer = {};
-    g_runtime->Shutdown();
+
+    {
+        auto queueLock = LockGraphicsQueue();
+        g_runtime->Shutdown();
+    }
+
     g_runtime.reset();
 
     std::lock_guard viewsLock(g_viewsMutex);
@@ -444,7 +499,13 @@ void VR::BeginFrame()
     if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
         return;
 
-    if (!g_runtime->BeginFrame(frame))
+    bool begun;
+    {
+        auto queueLock = LockGraphicsQueue();
+        begun = g_runtime->BeginFrame(frame);
+    }
+
+    if (!begun)
         return;
 
     g_runtime->LocateViews(frame);
@@ -500,6 +561,8 @@ void VR::AcquireImages(VRImages& images)
 // Ends a frame with a retained layer (or none). g_mutex is held.
 static void EndFrameWithLayer(const PortVr::OpenXRFrame& frame, const RetainedLayer& layer)
 {
+    auto queueLock = LockGraphicsQueue();
+
     if (layer.mode == VRFrameMode::None || !frame.should_render)
     {
         g_runtime->EndFrameWithoutLayers(frame);
@@ -579,7 +642,13 @@ static void KeepAlive()
     if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
         return;
 
-    if (!g_runtime->BeginFrame(frame))
+    bool begun;
+    {
+        auto queueLock = LockGraphicsQueue();
+        begun = g_runtime->BeginFrame(frame);
+    }
+
+    if (!begun)
         return;
 
     EndFrameWithLayer(frame, g_retainedLayer);
@@ -635,6 +704,7 @@ bool VR::EndFrame(const VRFrameResult& result)
 
     if (mode == VRFrameMode::None || !g_frame.should_render)
     {
+        auto queueLock = LockGraphicsQueue();
         g_runtime->EndFrameWithoutLayers(g_frame);
         return true;
     }

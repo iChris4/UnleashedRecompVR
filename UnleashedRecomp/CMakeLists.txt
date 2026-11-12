@@ -2,7 +2,7 @@ project("UnleashedRecomp")
 
 if (WIN32)
     option(UNLEASHED_RECOMP_D3D12 "Add D3D12 support for rendering" ON)
-    option(UNLEASHED_RECOMP_OPENXR "Add OpenXR (VR) support, D3D12 only for now" ON)
+    option(UNLEASHED_RECOMP_OPENXR "Add OpenXR (VR) support, with D3D12 or Vulkan" ON)
 endif()
 
 if (UNLEASHED_RECOMP_OPENXR AND NOT UNLEASHED_RECOMP_D3D12)
@@ -201,6 +201,7 @@ if (UNLEASHED_RECOMP_OPENXR)
     set(UNLEASHED_RECOMP_XR_CXX_SOURCES
         "xr/xr.cpp"
         "xr/xr_d3d12.cpp"
+        "xr/xr_vulkan.cpp"
         "xr/xr_input.cpp"
         "xr/core/openxr_runtime.cpp"
     )

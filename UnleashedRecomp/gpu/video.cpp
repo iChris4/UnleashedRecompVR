@@ -3445,16 +3445,19 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     GameWindow::Init(sdlVideoDriver);
 
-    // OpenXR must find the headset before the device exists: the runtime decides the adapter.
-    // VR currently requires D3D12, so a retry after a D3D12 crash stays flat.
-    std::string vrAdapterName;
+    // OpenXR must find the headset before the device exists: the runtime decides
+    // the GPU, and for Vulkan the extensions plume enables. The session uses the
+    // graphics API the game would pick (Vulkan under Wine or when chosen, D3D12
+    // otherwise); a retry after a crash stays flat.
+    bool vrVulkan = false;
 #ifdef UNLEASHED_RECOMP_D3D12
-    if (VR::s_requested && !graphicsApiRetry && VR::Init())
-        vrAdapterName = VR::GetAdapterName();
+    vrVulkan = DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan;
 #endif
+    if (VR::s_requested && !graphicsApiRetry)
+        VR::Init(vrVulkan);
 
 #ifdef UNLEASHED_RECOMP_D3D12
-    g_vulkan = !VR::IsInitialized() && (DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan);
+    g_vulkan = DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan;
 #endif
 
     // Attempt to create the possible backends using a vector of function pointers. Whichever succeeds first will be the chosen API.
@@ -3496,11 +3499,13 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
                 continue;
             }
 
-            bool useVRAdapter = false;
-#ifdef UNLEASHED_RECOMP_D3D12
-            useVRAdapter = (interfaceFunction == CreateD3D12Interface) && !vrAdapterName.empty();
-#endif
-            g_device = g_interface->createDevice(useVRAdapter ? vrAdapterName : Config::GraphicsDevice.Value);
+            // The VR session's API on the GPU the runtime requires.
+            std::string vrAdapterName;
+            bool vulkanInterface = (interfaceFunction == CreateVulkanInterfaceWrapper);
+            if (VR::IsInitialized() && vulkanInterface == vrVulkan)
+                vrAdapterName = VR::GetAdapterName(g_interface.get());
+
+            g_device = g_interface->createDevice(!vrAdapterName.empty() ? vrAdapterName : Config::GraphicsDevice.Value);
             if (g_device != nullptr)
             {
                 const RenderDeviceDescription &deviceDescription = g_device->getDescription();
@@ -3584,9 +3589,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         return false;
     }
 
-    if (VR::IsInitialized() && g_vulkan)
+    if (VR::IsInitialized() && g_vulkan != vrVulkan)
     {
-        LOGN_WARNING("[VR] D3D12 could not be used; VR requires it for now. The game will run without VR.");
+        LOGFN_WARNING("[VR] {} could not be used for the VR session. The game will run without VR.", vrVulkan ? "Vulkan" : "D3D12");
         VR::Shutdown();
     }
 
