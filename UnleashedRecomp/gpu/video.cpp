@@ -1066,6 +1066,11 @@ static moodycamel::BlockingConcurrentQueue<RenderCommand> g_renderQueue;
 
 // -1: not rendering for the headset; 0: the left eye, live; 1: the right eye, replayed.
 static int32_t g_vrPass = -1;
+
+// VR: single-pass stereo ([VR] VRSinglePass) draws both eyes at once into
+// two-layer targets, where frame replay draws one eye after the other. Fixed
+// for the run once the session exists. Not available yet: always replay.
+static bool g_vrSinglePass;
 static bool g_vrRecording;
 static std::vector<RenderCommand> g_vrRecordedCommands;
 
@@ -1310,6 +1315,88 @@ enum class VRDrawKind
     Reflection
 };
 
+// VR, groundwork for single-pass stereo: what each surface was used for by the
+// left eye's passes of the last 5 s, to decide which need a layer per eye. Only
+// surfaces drawn into or cleared are described (their fields are copied while
+// they are bound, so a destroyed one is never read); the surfaces their draws
+// read are matched by address. An entry is dropped with its surface.
+struct VRSurfaceUse
+{
+    uint32_t order;
+    uint32_t width;
+    uint32_t height;
+    uint32_t guestFormat;
+    RenderFormat format;
+    uint32_t sampleCount;
+    bool backBuffer;
+    bool orthographicDepth;
+    bool perspectiveDepth;
+    bool described;
+    uint32_t frames;
+    uint32_t lastFrame;
+    uint32_t cameraDraws;
+    uint32_t reflectionDraws;
+    uint32_t otherDraws;
+    uint32_t clears;
+    uint32_t resolves;
+    uint32_t lastResolveWidth;
+    uint32_t lastResolveHeight;
+    uint32_t reads;
+    std::array<const GuestSurface*, 8> sources;
+    uint32_t sourceCount;
+};
+
+static ankerl::unordered_dense::map<const GuestSurface*, VRSurfaceUse> g_vrSurfaceUses;
+static uint32_t g_vrSurfaceFrame;
+static uint32_t g_vrSurfaceCount;
+
+static VRSurfaceUse& NoteVRSurface(const GuestSurface* surface)
+{
+    auto [it, inserted] = g_vrSurfaceUses.try_emplace(surface);
+    VRSurfaceUse& use = it->second;
+
+    if (inserted)
+        use.order = ++g_vrSurfaceCount;
+
+    use.width = surface->width;
+    use.height = surface->height;
+    use.guestFormat = surface->guestFormat;
+    use.format = surface->format;
+    use.sampleCount = uint32_t(surface->sampleCount);
+    use.backBuffer = (surface == g_backBuffer);
+    use.orthographicDepth = surface->vrOrthographicDepth;
+    use.perspectiveDepth = surface->vrPerspectiveDepth;
+    use.described = true;
+
+    if (use.lastFrame != g_vrSurfaceFrame)
+    {
+        use.lastFrame = g_vrSurfaceFrame;
+        ++use.frames;
+    }
+
+    return use;
+}
+
+static void NoteVRSurfaceClear(const GuestSurface* renderTarget, const GuestSurface* depthStencil, uint32_t flags)
+{
+    if (renderTarget != nullptr && (flags & D3DCLEAR_TARGET) != 0)
+        ++NoteVRSurface(renderTarget).clears;
+
+    if (depthStencil != nullptr && (flags & D3DCLEAR_ZBUFFER) != 0)
+        ++NoteVRSurface(depthStencil).clears;
+}
+
+static void NoteVRSurfaceResolve(const GuestSurface* surface, const GuestTexture* texture)
+{
+    if (surface == nullptr)
+        return;
+
+    VRSurfaceUse& use = NoteVRSurface(surface);
+    ++use.resolves;
+    use.lastResolveWidth = texture->width;
+    use.lastResolveHeight = texture->height;
+}
+
 // What the last uploaded constants were rewritten for: the shader and kind of a
 // camera draw, the pixel shader of a neutralised boost or bloom pass, or null,
 // and whether the shared constants had the bloom feedback texture replaced. A
@@ -1369,6 +1456,7 @@ static XrMatrix LoadGuestMatrix(const uint32_t* constants, size_t firstRegister)
 static void BeginVRFrame()
 {
     g_vrPass = 0;
+    ++g_vrSurfaceFrame;
     g_vrRecording = true;
     g_vrRecordedCommands.clear();
     g_vrUploadRecords.clear();
@@ -2278,6 +2366,79 @@ bool Video::GetVRCameraState(float& lensX, float& lensY, float horizonLock[16])
     return true;
 }
 
+static const char* GetVRFormatName(RenderFormat format)
+{
+    switch (format)
+    {
+    case RenderFormat::R8G8B8A8_UNORM: return "RGBA8";
+    case RenderFormat::B8G8R8A8_UNORM: return "BGRA8";
+    case RenderFormat::R16G16B16A16_FLOAT: return "RGBA16F";
+    case RenderFormat::R16G16_FLOAT: return "RG16F";
+    case RenderFormat::R32_FLOAT: return "R32F";
+    case RenderFormat::R32G32_FLOAT: return "RG32F";
+    case RenderFormat::R8_UNORM: return "R8";
+    case RenderFormat::D32_FLOAT: return "D32F";
+    default: return "other";
+    }
+}
+
+// The surface dump: one line per surface the left eye's passes drew into,
+// cleared or copied out of, in order of first use, with what another layer
+// of each would cost, then the totals by kind.
+static void LogVRSurfaceUses()
+{
+    if (g_vrSurfaceUses.empty())
+        return;
+
+    std::vector<std::pair<const GuestSurface*, const VRSurfaceUse*>> uses;
+    for (const auto& [surface, use] : g_vrSurfaceUses)
+    {
+        if (use.described)
+            uses.emplace_back(surface, &use);
+    }
+
+    std::sort(uses.begin(), uses.end(), [](const auto& a, const auto& b) { return a.second->order < b.second->order; });
+
+    auto findOrder = [](const GuestSurface* surface) -> int64_t
+        {
+            auto findResult = g_vrSurfaceUses.find(surface);
+            return (findResult != g_vrSurfaceUses.end() && findResult->second.described) ? int64_t(findResult->second.order) : -1;
+        };
+
+    uint64_t cameraBytes = 0;
+    uint64_t otherBytes = 0;
+
+    for (const auto& [surface, use] : uses)
+    {
+        uint64_t bytes = uint64_t(use->width) * use->height * RenderFormatSize(use->format) * std::max(use->sampleCount, 1u);
+        bool perEye = use->cameraDraws != 0 || use->reflectionDraws != 0;
+        (perEye ? cameraBytes : otherBytes) += bytes;
+
+        std::string sources;
+        for (uint32_t i = 0; i < use->sourceCount; i++)
+        {
+            int64_t order = findOrder(use->sources[i]);
+            sources += (i == 0 ? "" : " ") + (order >= 0 ? fmt::format("#{}", order) : std::string("?"));
+        }
+
+        LOGFN("[VR] Surface #{}: {}x{} {} (guest {:08X}) x{}{}{}{}, {} frames, {:.1f} MB. Draws: camera {}, reflection {}, other {}; clears {}; "
+            "copied out {} (last into {}x{}); read by {} draws; its draws read [{}].",
+            use->order, use->width, use->height, GetVRFormatName(use->format), use->guestFormat, use->sampleCount,
+            use->backBuffer ? ", back buffer" : "",
+            use->orthographicDepth ? ", orthographic depth" : "",
+            use->perspectiveDepth ? ", perspective depth" : "",
+            use->frames, double(bytes) / (1024.0 * 1024.0),
+            use->cameraDraws, use->reflectionDraws, use->otherDraws, use->clears,
+            use->resolves, use->lastResolveWidth, use->lastResolveHeight, use->reads, sources);
+    }
+
+    LOGFN("[VR] Surfaces: {} described; {:.1f} MB drawn through the camera, {:.1f} MB otherwise.",
+        uses.size(), double(cameraBytes) / (1024.0 * 1024.0), double(otherBytes) / (1024.0 * 1024.0));
+
+    g_vrSurfaceUses.clear();
+    g_vrSurfaceCount = 0;
+}
+
 static void LogVRStatistics()
 {
     static auto s_lastLogTime = std::chrono::steady_clock::now();
@@ -2356,6 +2517,8 @@ static void LogVRStatistics()
             s.mainSampleTaken ? formatMatrix(s.mainSampleProjection) : std::string("-"),
             s.mainSampleTaken ? formatMatrix(s.mainSampleView) : std::string("-"));
     }
+
+    LogVRSurfaceUses();
 
     g_vrStatistics = {};
 }
@@ -3657,6 +3820,17 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         VR::Shutdown();
     }
 
+    if (VR::IsInitialized())
+    {
+        LOGFN("[VR] Layer and viewport selection in vertex shaders: {}.",
+            g_capabilities.vertexShaderLayerAndViewport ? "supported" : "not supported");
+
+        if (Config::VRSinglePass)
+            LOGN_WARNING("[VR] Single-pass stereo is not available yet; the eyes are drawn one after the other.");
+
+        g_vrSinglePass = false;
+    }
+
     uint32_t bufferCount = 2;
 
     switch (Config::TripleBuffering)
@@ -4005,6 +4179,9 @@ static void ProcDestructResource(const RenderCommand& cmd)
     // before the address can be reused.
     if (g_vrReflectionSurfaceSeen != nullptr && args.resource == g_vrReflectionSurfaceSeen)
         g_vrReflectionSurfaceSeen = nullptr;
+
+    if (args.resource->type == ResourceType::RenderTarget || args.resource->type == ResourceType::DepthStencil)
+        g_vrSurfaceUses.erase(static_cast<const GuestSurface*>(args.resource));
 }
 
 static uint32_t ComputeTexturePitch(GuestTexture* texture)
@@ -5511,6 +5688,9 @@ static void ProcStretchRect(const RenderCommand& cmd)
         return;
     }
 
+    if (g_vrPass == 0)
+        NoteVRSurfaceResolve(surface, args.texture);
+
     // Erase previous pending command so it doesn't cause the texture to be overriden.
     if (args.texture->sourceSurface != nullptr)
         args.texture->sourceSurface->destinationTextures.erase(args.texture);
@@ -5921,6 +6101,9 @@ static void Clear(GuestDevice* device, uint32_t flags, uint32_t, be<float>* colo
 static void ProcClear(const RenderCommand& cmd)
 {
     const auto& args = cmd.clear;
+
+    if (g_vrPass == 0)
+        NoteVRSurfaceClear(g_renderTarget, g_depthStencil, args.flags);
 
     if (ShouldReuseVRShadowWork())
         return;
@@ -6702,6 +6885,51 @@ static void ProcAddPipeline(const RenderCommand& cmd)
 static constexpr int32_t COMMON_DEPTH_BIAS_VALUE = int32_t((1 << 24) * 0.002f);
 static constexpr float COMMON_SLOPE_SCALED_DEPTH_BIAS_VALUE = 1.0f;
 
+static void NoteVRSurfaceDraw(GuestSurface* renderTarget, GuestSurface* depthStencil, VRDrawKind kind)
+{
+    GuestSurface* target = renderTarget != nullptr ? renderTarget : depthStencil;
+    if (target == nullptr)
+        return;
+
+    for (GuestSurface* surface : { renderTarget, depthStencil })
+    {
+        if (surface == nullptr)
+            continue;
+
+        VRSurfaceUse& use = NoteVRSurface(surface);
+
+        if (kind == VRDrawKind::Camera)
+            ++use.cameraDraws;
+        else if (kind == VRDrawKind::Reflection)
+            ++use.reflectionDraws;
+        else
+            ++use.otherDraws;
+    }
+
+    VRSurfaceUse& targetUse = g_vrSurfaceUses[target];
+    GuestShader* pixelShader = g_pipelineState.pixelShader;
+    uint32_t samplerMask = pixelShader != nullptr ? pixelShader->vrSamplerMask : 0;
+
+    for (uint32_t i = 0; i < std::size(g_textures); i++)
+    {
+        const GuestTexture* texture = g_textures[i];
+        if ((samplerMask & (1u << i)) == 0 || texture == nullptr || texture->vrResolvedFrom == nullptr)
+            continue;
+
+        const GuestSurface* source = texture->vrResolvedFrom;
+
+        // Only counted for a surface already described: one known by a stale
+        // pointer alone is never added.
+        auto findResult = g_vrSurfaceUses.find(source);
+        if (findResult != g_vrSurfaceUses.end())
+            ++findResult->second.reads;
+
+        auto sourcesEnd = targetUse.sources.begin() + targetUse.sourceCount;
+        if (std::find(targetUse.sources.begin(), sourcesEnd, source) == sourcesEnd && targetUse.sourceCount < targetUse.sources.size())
+            targetUse.sources[targetUse.sourceCount++] = source;
+    }
+}
+
 static void FlushRenderStateForRenderThread()
 {
     // VR: only a draw just put on the HUD panel has its scissor moved there.
@@ -6796,6 +7024,9 @@ static void FlushRenderStateForRenderThread()
     bool vrReplaceBloomFeedback = ShouldReplaceVRBloomFeedback();
     bool vrPatchLightShafts = ShouldPatchVRLightShafts();
     bool vrNeutraliseDepthOfField = ShouldNeutraliseVRDepthOfField();
+
+    if (g_vrPass == 0)
+        NoteVRSurfaceDraw(renderTarget, depthStencil, vrDrawKind);
 
     if (vrReplaceBloomFeedback && g_vrPass == 0)
         NoteVRBloomFeedback(renderTarget);
@@ -7459,6 +7690,8 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
     constexpr uint16_t RegisterSetFloat4 = 2;
     constexpr uint16_t RegisterSetSampler = 3;
 
+    shader->vrSamplerMask = 0;
+
     for (uint32_t i = 0; i < constantCount; i++)
     {
         uint32_t entryOffset = constantInfoOffset + i * ConstantInfoSize;
@@ -7478,6 +7711,9 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
 
         if (registerSet == RegisterSetSampler)
         {
+            for (uint32_t j = registerIndex; j < uint32_t(registerIndex) + std::max<uint16_t>(registerCount, 1) && j < 16; j++)
+                shader->vrSamplerMask |= uint16_t(1u << j);
+
             if (name == "g_ReflectionMapSampler" && registerIndex < std::size(g_textures))
                 shader->vrReflectionSamplerRegister = int8_t(registerIndex);
         }

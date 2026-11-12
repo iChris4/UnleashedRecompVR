@@ -338,6 +338,10 @@ struct GuestShader : GuestResource
 
     // VR: the sampler register of the planar reflection map (g_ReflectionMapSampler), or -1.
     int8_t vrReflectionSamplerRegister = -1;
+
+    // VR: the sampler registers the shader declares, from its constant table (all
+    // of them when it has none), for the surface dump.
+    uint16_t vrSamplerMask = 0xFFFF;
 #ifdef UNLEASHED_RECOMP_D3D12
     std::vector<ComPtr<IDxcBlob>> shaderBlobs;
     ComPtr<IDxcBlobEncoding> libraryBlob;
