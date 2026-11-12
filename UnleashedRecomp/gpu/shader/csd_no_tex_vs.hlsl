@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -26,8 +27,8 @@ cbuffer SharedConstants : register(b2, space4)
 
 void main(
 	[[vk::location(0)]] in float4 iPosition0 : POSITION0,
-	[[vk::location(8)]] in float4 iColor0 : COLOR0,
-	out float4 oPos : SV_Position,
+	[[vk::location(8)]] in float4 iColor0 : COLOR0 VR_VS_INSTANCE_INPUT,
+	out float4 oPos : SV_Position VR_VS_EYE_OUTPUT,
 	out float4 oTexCoord0 : TEXCOORD0,
 	out float4 oTexCoord1 : TEXCOORD1,
 	out float4 oTexCoord2 : TEXCOORD2,
@@ -45,8 +46,9 @@ void main(
 	out float4 oTexCoord14 : TEXCOORD14,
 	out float4 oTexCoord15 : TEXCOORD15,
 	out float4 oColor0 : COLOR0,
-	out float4 oColor1 : COLOR1)
+	out float4 oColor1 : COLOR1 VR_VS_LAYER_OUTPUTS)
 {
+    VR_GAME_VS_EYE();
     oPos = ApplyVRHud(iPosition0.xy * g_ViewportSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0), g_Z.x);
     oTexCoord0 = iColor0.wxyz;
     oTexCoord1 = 0.0;

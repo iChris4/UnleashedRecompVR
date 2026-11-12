@@ -78,12 +78,12 @@ float median(float r, float g, float b)
     return max(min(r, g), min(max(r, g), b));
 }
 
-float4 SampleSdfFont(float4 color, Texture2D<float4> texture, float2 uv, float2 screenTexSize)
+float4 SampleSdfFont(float4 color, VR_TEXTURE_2D(float4) texture, float2 uv, float2 screenTexSize)
 {
-    float4 textureColor = texture.Sample(g_SamplerDescriptorHeap[0], uv);
+    float4 textureColor = texture.Sample(g_SamplerDescriptorHeap[0], VR_SAMPLE_COORD(uv, 0));
     
     uint width, height;
-    texture.GetDimensions(width, height);
+    VR_GET_DIMENSIONS(texture, width, height);
             
     float pxRange = 8.0;
     float2 unitRange = pxRange / float2(width, height);
@@ -130,7 +130,7 @@ float4 main(in Interpolators interpolators) : SV_Target
     
     if (g_PushConstants.Texture2DDescriptorIndex != 0)
     {
-        Texture2D<float4> texture = g_Texture2DDescriptorHeap[g_PushConstants.Texture2DDescriptorIndex & 0x7FFFFFFF];
+        VR_TEXTURE_2D(float4) texture = g_Texture2DDescriptorHeap[g_PushConstants.Texture2DDescriptorIndex & 0x7FFFFFFF];
         
         if ((g_PushConstants.Texture2DDescriptorIndex & 0x80000000) != 0)
         {
@@ -174,7 +174,7 @@ float4 main(in Interpolators interpolators) : SV_Target
         }
         else
         {
-            color *= texture.Sample(g_SamplerDescriptorHeap[0], interpolators.UV);
+            color *= texture.Sample(g_SamplerDescriptorHeap[0], VR_SAMPLE_COORD(interpolators.UV, 0));
         }
     }
     

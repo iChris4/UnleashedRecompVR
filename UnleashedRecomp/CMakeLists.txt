@@ -451,6 +451,12 @@ endif()
 
 target_precompile_headers(UnleashedRecomp PUBLIC ${UNLEASHED_RECOMP_PRECOMPILED_HEADERS})
 
+# The shared shader headers, which every shader may include.
+file(GLOB UNLEASHED_RECOMP_SHADER_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/gpu/shader/*.hlsli)
+list(APPEND UNLEASHED_RECOMP_SHADER_HEADERS ${UNLEASHED_RECOMP_TOOLS_ROOT}/XenosRecomp/XenosRecomp/shader_common.h)
+
+# Each shader is also compiled with VR_STEREO, for VR's single-pass stereo
+# (gpu/shader/vr_stereo.hlsli): g_<name>_stereo_dxil and g_<name>_stereo_spirv.
 function(compile_shader FILE_PATH TARGET_NAME)
     set(FILE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/gpu/shader/${FILE_PATH}.hlsl)
     cmake_path(GET FILE_PATH STEM VARIABLE_NAME)
@@ -458,16 +464,26 @@ function(compile_shader FILE_PATH TARGET_NAME)
         add_custom_command(
             OUTPUT ${FILE_PATH}.dxil.h
             COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -Wno-ignored-attributes -Fh ${FILE_PATH}.dxil.h ${FILE_PATH} -Vn g_${VARIABLE_NAME}_dxil
-            DEPENDS ${FILE_PATH}
+            DEPENDS ${FILE_PATH} ${UNLEASHED_RECOMP_SHADER_HEADERS}
         )
-        target_sources(UnleashedRecomp PRIVATE ${FILE_PATH}.dxil.h)
+        add_custom_command(
+            OUTPUT ${FILE_PATH}.stereo.dxil.h
+            COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -Wno-ignored-attributes -DVR_STEREO -Fh ${FILE_PATH}.stereo.dxil.h ${FILE_PATH} -Vn g_${VARIABLE_NAME}_stereo_dxil
+            DEPENDS ${FILE_PATH} ${UNLEASHED_RECOMP_SHADER_HEADERS}
+        )
+        target_sources(UnleashedRecomp PRIVATE ${FILE_PATH}.dxil.h ${FILE_PATH}.stereo.dxil.h)
     endif()
     add_custom_command(
         OUTPUT ${FILE_PATH}.spirv.h
         COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout ${ARGN} -Fh ${FILE_PATH}.spirv.h ${FILE_PATH} -Vn g_${VARIABLE_NAME}_spirv
-        DEPENDS ${FILE_PATH}
+        DEPENDS ${FILE_PATH} ${UNLEASHED_RECOMP_SHADER_HEADERS}
     )
-    target_sources(UnleashedRecomp PRIVATE ${FILE_PATH}.spirv.h)
+    add_custom_command(
+        OUTPUT ${FILE_PATH}.stereo.spirv.h
+        COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout ${ARGN} -DVR_STEREO -Fh ${FILE_PATH}.stereo.spirv.h ${FILE_PATH} -Vn g_${VARIABLE_NAME}_stereo_spirv
+        DEPENDS ${FILE_PATH} ${UNLEASHED_RECOMP_SHADER_HEADERS}
+    )
+    target_sources(UnleashedRecomp PRIVATE ${FILE_PATH}.spirv.h ${FILE_PATH}.stereo.spirv.h)
 endfunction()
 
 function(compile_vertex_shader FILE_PATH)

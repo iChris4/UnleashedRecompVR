@@ -47,61 +47,115 @@
 
 #ifdef UNLEASHED_RECOMP_D3D12
 #include "shader/blend_color_alpha_ps.hlsl.dxil.h"
+#include "shader/blend_color_alpha_ps.hlsl.stereo.dxil.h"
 #include "shader/copy_vs.hlsl.dxil.h"
+#include "shader/copy_vs.hlsl.stereo.dxil.h"
 #include "shader/copy_color_ps.hlsl.dxil.h"
+#include "shader/copy_color_ps.hlsl.stereo.dxil.h"
 #include "shader/copy_depth_ps.hlsl.dxil.h"
+#include "shader/copy_depth_ps.hlsl.stereo.dxil.h"
 #include "shader/csd_filter_ps.hlsl.dxil.h"
+#include "shader/csd_filter_ps.hlsl.stereo.dxil.h"
 #include "shader/csd_no_tex_vs.hlsl.dxil.h"
+#include "shader/csd_no_tex_vs.hlsl.stereo.dxil.h"
 #include "shader/csd_vs.hlsl.dxil.h"
+#include "shader/csd_vs.hlsl.stereo.dxil.h"
 #include "shader/enhanced_motion_blur_ps.hlsl.dxil.h"
+#include "shader/enhanced_motion_blur_ps.hlsl.stereo.dxil.h"
 #include "shader/gamma_correction_ps.hlsl.dxil.h"
+#include "shader/gamma_correction_ps.hlsl.stereo.dxil.h"
 #include "shader/gaussian_blur_3x3.hlsl.dxil.h"
+#include "shader/gaussian_blur_3x3.hlsl.stereo.dxil.h"
 #include "shader/gaussian_blur_5x5.hlsl.dxil.h"
+#include "shader/gaussian_blur_5x5.hlsl.stereo.dxil.h"
 #include "shader/gaussian_blur_7x7.hlsl.dxil.h"
+#include "shader/gaussian_blur_7x7.hlsl.stereo.dxil.h"
 #include "shader/gaussian_blur_9x9.hlsl.dxil.h"
+#include "shader/gaussian_blur_9x9.hlsl.stereo.dxil.h"
 #include "shader/imgui_ps.hlsl.dxil.h"
+#include "shader/imgui_ps.hlsl.stereo.dxil.h"
 #include "shader/imgui_vs.hlsl.dxil.h"
+#include "shader/imgui_vs.hlsl.stereo.dxil.h"
 #include "shader/movie_ps.hlsl.dxil.h"
+#include "shader/movie_ps.hlsl.stereo.dxil.h"
 #include "shader/movie_vs.hlsl.dxil.h"
+#include "shader/movie_vs.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_color_2x.hlsl.dxil.h"
+#include "shader/resolve_msaa_color_2x.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_color_4x.hlsl.dxil.h"
+#include "shader/resolve_msaa_color_4x.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_color_8x.hlsl.dxil.h"
+#include "shader/resolve_msaa_color_8x.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_depth_2x.hlsl.dxil.h"
+#include "shader/resolve_msaa_depth_2x.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_depth_4x.hlsl.dxil.h"
+#include "shader/resolve_msaa_depth_4x.hlsl.stereo.dxil.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.dxil.h"
+#include "shader/resolve_msaa_depth_8x.hlsl.stereo.dxil.h"
 #include "shader/xr_blit_ps.hlsl.dxil.h"
+#include "shader/xr_blit_ps.hlsl.stereo.dxil.h"
 #include "shader/xr_output_ps.hlsl.dxil.h"
+#include "shader/xr_output_ps.hlsl.stereo.dxil.h"
 #include "shader/xr_ui_ps.hlsl.dxil.h"
+#include "shader/xr_ui_ps.hlsl.stereo.dxil.h"
 #include "shader/xr_ui_vs.hlsl.dxil.h"
+#include "shader/xr_ui_vs.hlsl.stereo.dxil.h"
 #endif
 
 #include "shader/blend_color_alpha_ps.hlsl.spirv.h"
+#include "shader/blend_color_alpha_ps.hlsl.stereo.spirv.h"
 #include "shader/copy_vs.hlsl.spirv.h"
+#include "shader/copy_vs.hlsl.stereo.spirv.h"
 #include "shader/copy_color_ps.hlsl.spirv.h"
+#include "shader/copy_color_ps.hlsl.stereo.spirv.h"
 #include "shader/copy_depth_ps.hlsl.spirv.h"
+#include "shader/copy_depth_ps.hlsl.stereo.spirv.h"
 #include "shader/csd_filter_ps.hlsl.spirv.h"
+#include "shader/csd_filter_ps.hlsl.stereo.spirv.h"
 #include "shader/csd_no_tex_vs.hlsl.spirv.h"
+#include "shader/csd_no_tex_vs.hlsl.stereo.spirv.h"
 #include "shader/csd_vs.hlsl.spirv.h"
+#include "shader/csd_vs.hlsl.stereo.spirv.h"
 #include "shader/enhanced_motion_blur_ps.hlsl.spirv.h"
+#include "shader/enhanced_motion_blur_ps.hlsl.stereo.spirv.h"
 #include "shader/gamma_correction_ps.hlsl.spirv.h"
+#include "shader/gamma_correction_ps.hlsl.stereo.spirv.h"
 #include "shader/gaussian_blur_3x3.hlsl.spirv.h"
+#include "shader/gaussian_blur_3x3.hlsl.stereo.spirv.h"
 #include "shader/gaussian_blur_5x5.hlsl.spirv.h"
+#include "shader/gaussian_blur_5x5.hlsl.stereo.spirv.h"
 #include "shader/gaussian_blur_7x7.hlsl.spirv.h"
+#include "shader/gaussian_blur_7x7.hlsl.stereo.spirv.h"
 #include "shader/gaussian_blur_9x9.hlsl.spirv.h"
+#include "shader/gaussian_blur_9x9.hlsl.stereo.spirv.h"
 #include "shader/imgui_ps.hlsl.spirv.h"
+#include "shader/imgui_ps.hlsl.stereo.spirv.h"
 #include "shader/imgui_vs.hlsl.spirv.h"
+#include "shader/imgui_vs.hlsl.stereo.spirv.h"
 #include "shader/movie_ps.hlsl.spirv.h"
+#include "shader/movie_ps.hlsl.stereo.spirv.h"
 #include "shader/movie_vs.hlsl.spirv.h"
+#include "shader/movie_vs.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_color_2x.hlsl.spirv.h"
+#include "shader/resolve_msaa_color_2x.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_color_4x.hlsl.spirv.h"
+#include "shader/resolve_msaa_color_4x.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_color_8x.hlsl.spirv.h"
+#include "shader/resolve_msaa_color_8x.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_depth_2x.hlsl.spirv.h"
+#include "shader/resolve_msaa_depth_2x.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_depth_4x.hlsl.spirv.h"
+#include "shader/resolve_msaa_depth_4x.hlsl.stereo.spirv.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.spirv.h"
+#include "shader/resolve_msaa_depth_8x.hlsl.stereo.spirv.h"
 #include "shader/xr_blit_ps.hlsl.spirv.h"
+#include "shader/xr_blit_ps.hlsl.stereo.spirv.h"
 #include "shader/xr_output_ps.hlsl.spirv.h"
+#include "shader/xr_output_ps.hlsl.stereo.spirv.h"
 #include "shader/xr_ui_ps.hlsl.spirv.h"
+#include "shader/xr_ui_ps.hlsl.stereo.spirv.h"
 #include "shader/xr_ui_vs.hlsl.spirv.h"
+#include "shader/xr_ui_vs.hlsl.stereo.spirv.h"
 
 #ifdef _WIN32
 extern "C"
@@ -351,6 +405,7 @@ static std::unique_ptr<GuestSurface> g_backBufferHolder;
 static GuestSurface* g_backBuffer;
 
 static std::unique_ptr<RenderTexture> g_intermediaryBackBufferTexture;
+static std::unique_ptr<RenderTextureView> g_intermediaryBackBufferTextureView;
 static uint32_t g_intermediaryBackBufferTextureWidth;
 static uint32_t g_intermediaryBackBufferTextureHeight;
 static uint32_t g_intermediaryBackBufferTextureDescriptorIndex;
@@ -361,6 +416,7 @@ static std::unique_ptr<RenderPipeline> g_gammaCorrectionPipeline;
 // OpenXR swapchains can be copied from. Copied into the headset's image and
 // scaled into the window.
 static std::unique_ptr<RenderTexture> g_vrOutputTexture;
+static std::unique_ptr<RenderTextureView> g_vrOutputTextureView;
 static std::unique_ptr<RenderFramebuffer> g_vrOutputFramebuffer;
 static uint32_t g_vrOutputTextureWidth;
 static uint32_t g_vrOutputTextureHeight;
@@ -838,6 +894,23 @@ static void LoadEmbeddedResources()
     g_buttonBcDiff = decompressZstd(g_button_bc_diff, g_button_bc_diff_uncompressed_size);
 }
 
+// VR single-pass stereo: the shaders' VR_STEREO variants replace the cache.
+static void LoadStereoShaderCache()
+{
+    if (g_vulkan)
+    {
+        g_shaderCache = std::make_unique<uint8_t[]>(g_stereoSpirvCacheDecompressedSize);
+        ZSTD_decompress(g_shaderCache.get(), g_stereoSpirvCacheDecompressedSize, g_compressedStereoSpirvCache, g_stereoSpirvCacheCompressedSize);
+    }
+#ifdef UNLEASHED_RECOMP_D3D12
+    else
+    {
+        g_shaderCache = std::make_unique<uint8_t[]>(g_stereoDxilCacheDecompressedSize);
+        ZSTD_decompress(g_shaderCache.get(), g_stereoDxilCacheDecompressedSize, g_compressedStereoDxilCache, g_stereoDxilCacheCompressedSize);
+    }
+#endif
+}
+
 enum class CsdFilterState
 {
     Unknown,
@@ -1069,7 +1142,9 @@ static int32_t g_vrPass = -1;
 
 // VR: single-pass stereo ([VR] VRSinglePass) draws both eyes at once into
 // two-layer targets, where frame replay draws one eye after the other. Fixed
-// for the run once the session exists. Not available yet: always replay.
+// for the run once the session exists, before any shader or texture view.
+// For now it only selects the shaders' VR_STEREO variants and array views:
+// frame replay still draws the eyes, both into layer 0.
 static bool g_vrSinglePass;
 static bool g_vrRecording;
 static std::vector<RenderCommand> g_vrRecordedCommands;
@@ -1125,6 +1200,7 @@ struct VREyeState
 // The UI drawn with ImGui in stereo frames: drawn once into this texture during
 // the left eye's pass, then put on the HUD panel in each eye.
 static std::unique_ptr<RenderTexture> g_vrUiTexture;
+static std::unique_ptr<RenderTextureView> g_vrUiTextureView;
 static uint32_t g_vrUiTextureWidth;
 static uint32_t g_vrUiTextureHeight;
 static std::unique_ptr<RenderFramebuffer> g_vrUiFramebuffer;
@@ -3181,7 +3257,8 @@ static std::unique_ptr<GuestShader> g_enhancedMotionBlurShader;
 
 #ifdef UNLEASHED_RECOMP_D3D12
 
-#define CREATE_SHADER(NAME) \
+// VR single-pass stereo uses every host shader's VR_STEREO variant.
+#define CREATE_SHADER_VARIANT(NAME) \
     g_device->createShader( \
         g_vulkan ? g_##NAME##_spirv : g_##NAME##_dxil, \
         g_vulkan ? sizeof(g_##NAME##_spirv) : sizeof(g_##NAME##_dxil), \
@@ -3190,10 +3267,13 @@ static std::unique_ptr<GuestShader> g_enhancedMotionBlurShader;
 
 #else
 
-#define CREATE_SHADER(NAME) \
+#define CREATE_SHADER_VARIANT(NAME) \
     g_device->createShader(g_##NAME##_spirv, sizeof(g_##NAME##_spirv), "main", RenderShaderFormat::SPIRV)
 
 #endif
+
+#define CREATE_SHADER(NAME) \
+    (g_vrSinglePass ? CREATE_SHADER_VARIANT(NAME##_stereo) : CREATE_SHADER_VARIANT(NAME))
 
 #ifdef _WIN32
 static bool DetectWine()
@@ -3245,6 +3325,32 @@ struct ImGuiPushConstants
 };
 
 extern ImFontBuilderIO g_fontBuilderIO;
+
+// VR single-pass stereo: every shader reads 2D textures as arrays (see
+// shader_common.h), so their views are array views. The texture's own view
+// dimension (GuestTexture::viewDimension) stays TEXTURE_2D.
+static RenderTextureViewDimension GetShaderViewDimension(RenderTextureViewDimension dimension)
+{
+    return (g_vrSinglePass && dimension == RenderTextureViewDimension::TEXTURE_2D) ? RenderTextureViewDimension::TEXTURE_2D_ARRAY : dimension;
+}
+
+// Points a descriptor at a 2D texture of one mip level that has no view of its
+// own, through an array view kept in `view` in single-pass stereo.
+static void SetTexture2DDescriptor(uint32_t descriptorIndex, RenderTexture* texture, RenderFormat format, std::unique_ptr<RenderTextureView>& view)
+{
+    view.reset();
+
+    if (g_vrSinglePass)
+    {
+        RenderTextureViewDesc viewDesc;
+        viewDesc.format = format;
+        viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D_ARRAY;
+        viewDesc.mipLevels = 1;
+        view = texture->createTextureView(viewDesc);
+    }
+
+    g_textureDescriptorSet->setTexture(descriptorIndex, texture, RenderTextureLayout::SHADER_READ, view.get());
+}
 
 static void CreateImGuiBackend()
 {
@@ -3330,7 +3436,7 @@ static void CreateImGuiBackend()
 
     RenderTextureViewDesc textureViewDesc;
     textureViewDesc.format = textureDesc.format;
-    textureViewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+    textureViewDesc.dimension = GetShaderViewDimension(RenderTextureViewDimension::TEXTURE_2D);
     textureViewDesc.mipLevels = 1;
     g_imFontTexture->textureView = g_imFontTexture->texture->createTextureView(textureViewDesc);
 
@@ -3471,8 +3577,9 @@ static void BeginCommandList()
 
                 Video::WaitForGPU(); // Fine to wait for GPU, this'll only happen during resize.
 
+                g_intermediaryBackBufferTextureView.reset();
                 g_intermediaryBackBufferTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
-                g_textureDescriptorSet->setTexture(g_intermediaryBackBufferTextureDescriptorIndex, g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ);
+                SetTexture2DDescriptor(g_intermediaryBackBufferTextureDescriptorIndex, g_intermediaryBackBufferTexture.get(), BACKBUFFER_FORMAT, g_intermediaryBackBufferTextureView);
 
                 g_intermediaryBackBufferTextureWidth = width;
                 g_intermediaryBackBufferTextureHeight = height;
@@ -3501,8 +3608,9 @@ static void BeginCommandList()
             Video::WaitForGPU(); // Only when the headset's resolution changes.
 
             g_vrOutputFramebuffer.reset();
+            g_vrOutputTextureView.reset();
             g_vrOutputTexture = g_device->createTexture(RenderTextureDesc::Texture2D(outputWidth, outputHeight, 1, VR::GetImageFormat(), RenderTextureFlag::RENDER_TARGET));
-            g_textureDescriptorSet->setTexture(g_vrOutputTextureDescriptorIndex, g_vrOutputTexture.get(), RenderTextureLayout::SHADER_READ);
+            SetTexture2DDescriptor(g_vrOutputTextureDescriptorIndex, g_vrOutputTexture.get(), VR::GetImageFormat(), g_vrOutputTextureView);
 
             RenderFramebufferDesc framebufferDesc;
             const RenderTexture* colorAttachment = g_vrOutputTexture.get();
@@ -3522,8 +3630,9 @@ static void BeginCommandList()
             Video::WaitForGPU(); // Only when the screen resolution changes.
 
             g_vrUiFramebuffer.reset();
+            g_vrUiTextureView.reset();
             g_vrUiTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
-            g_textureDescriptorSet->setTexture(g_vrUiTextureDescriptorIndex, g_vrUiTexture.get(), RenderTextureLayout::SHADER_READ);
+            SetTexture2DDescriptor(g_vrUiTextureDescriptorIndex, g_vrUiTexture.get(), BACKBUFFER_FORMAT, g_vrUiTextureView);
 
             RenderFramebufferDesc framebufferDesc;
             const RenderTexture* colorAttachment = g_vrUiTexture.get();
@@ -3829,10 +3938,17 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         LOGFN("[VR] Layer and viewport selection in vertex shaders: {}.",
             g_capabilities.vertexShaderLayerAndViewport ? "supported" : "not supported");
 
-        if (Config::VRSinglePass)
-            LOGN_WARNING("[VR] Single-pass stereo is not available yet; the eyes are drawn one after the other.");
+        g_vrSinglePass = Config::VRSinglePass && g_capabilities.vertexShaderLayerAndViewport;
 
-        g_vrSinglePass = false;
+        if (g_vrSinglePass)
+        {
+            LOGN("[VR] Single-pass stereo shaders in use; the eyes are still drawn one after the other.");
+            LoadStereoShaderCache();
+        }
+        else if (Config::VRSinglePass)
+        {
+            LOGN_WARNING("[VR] Single-pass stereo needs layer and viewport selection in vertex shaders; the eyes are drawn one after the other.");
+        }
     }
 
     uint32_t bufferCount = 2;
@@ -3902,7 +4018,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         case TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D:
             desc.dimension = RenderTextureDimension::TEXTURE_2D;
             desc.arraySize = 1;
-            viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+            viewDesc.dimension = GetShaderViewDimension(RenderTextureViewDimension::TEXTURE_2D);
             break;
 
         case TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D:
@@ -5519,9 +5635,11 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
     texture->textureHolder = g_device->createTexture(desc);
     texture->texture = texture->textureHolder.get();
 
+    RenderTextureViewDimension viewDimension = texture->type == ResourceType::VolumeTexture ? RenderTextureViewDimension::TEXTURE_3D : RenderTextureViewDimension::TEXTURE_2D;
+
     RenderTextureViewDesc viewDesc;
     viewDesc.format = desc.format;
-    viewDesc.dimension = texture->type == ResourceType::VolumeTexture ? RenderTextureViewDimension::TEXTURE_3D : RenderTextureViewDimension::TEXTURE_2D;
+    viewDesc.dimension = GetShaderViewDimension(viewDimension);
     viewDesc.mipLevels = levels;
 
     switch (format)
@@ -5544,7 +5662,7 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
     texture->height = height;
     texture->depth = depth;
     texture->format = desc.format;
-    texture->viewDimension = viewDesc.dimension;
+    texture->viewDimension = viewDimension;
     texture->descriptorIndex = g_textureDescriptorAllocator.allocate();
 
     g_textureDescriptorSet->setTexture(texture->descriptorIndex, texture->texture, RenderTextureLayout::SHADER_READ, texture->textureView.get());
@@ -5610,7 +5728,7 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
     surface->sampleCount = desc.multisampling.sampleCount;
 
     RenderTextureViewDesc viewDesc;
-    viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+    viewDesc.dimension = GetShaderViewDimension(RenderTextureViewDimension::TEXTURE_2D);
     viewDesc.format = desc.format;
     viewDesc.mipLevels = 1;
     surface->textureView = surface->textureHolder->createTextureView(viewDesc);
@@ -6286,6 +6404,26 @@ static void ProcSetScissorRect(const RenderCommand& cmd)
     SetDirtyValue<int32_t>(g_dirtyStates.scissorRect, g_scissorRect.right, args.right);
 }
 
+static uint32_t GetShaderDxilOffset(const ShaderCacheEntry* entry)
+{
+    return g_vrSinglePass ? entry->stereoDxilOffset : entry->dxilOffset;
+}
+
+static uint32_t GetShaderDxilSize(const ShaderCacheEntry* entry)
+{
+    return g_vrSinglePass ? entry->stereoDxilSize : entry->dxilSize;
+}
+
+static uint32_t GetShaderSpirvOffset(const ShaderCacheEntry* entry)
+{
+    return g_vrSinglePass ? entry->stereoSpirvOffset : entry->spirvOffset;
+}
+
+static uint32_t GetShaderSpirvSize(const ShaderCacheEntry* entry)
+{
+    return g_vrSinglePass ? entry->stereoSpirvSize : entry->spirvSize;
+}
+
 static RenderShader* GetOrLinkShader(GuestShader* guestShader, uint32_t specConstants)
 {
     if (g_vulkan ||
@@ -6300,18 +6438,18 @@ static RenderShader* GetOrLinkShader(GuestShader* guestShader, uint32_t specCons
 
             if (g_vulkan)
             {
-                auto compressedSpirvData = g_shaderCache.get() + guestShader->shaderCacheEntry->spirvOffset;
+                auto compressedSpirvData = g_shaderCache.get() + GetShaderSpirvOffset(guestShader->shaderCacheEntry);
 
-                std::vector<uint8_t> decoded(smolv::GetDecodedBufferSize(compressedSpirvData, guestShader->shaderCacheEntry->spirvSize));
-                bool result = smolv::Decode(compressedSpirvData, guestShader->shaderCacheEntry->spirvSize, decoded.data(), decoded.size());
+                std::vector<uint8_t> decoded(smolv::GetDecodedBufferSize(compressedSpirvData, GetShaderSpirvSize(guestShader->shaderCacheEntry)));
+                bool result = smolv::Decode(compressedSpirvData, GetShaderSpirvSize(guestShader->shaderCacheEntry), decoded.data(), decoded.size());
                 assert(result);
 
                 guestShader->shader = g_device->createShader(decoded.data(), decoded.size(), "main", RenderShaderFormat::SPIRV);
             }
             else
             {
-                guestShader->shader = g_device->createShader(g_shaderCache.get() + guestShader->shaderCacheEntry->dxilOffset, 
-                    guestShader->shaderCacheEntry->dxilSize, "main", RenderShaderFormat::DXIL);
+                guestShader->shader = g_device->createShader(g_shaderCache.get() + GetShaderDxilOffset(guestShader->shaderCacheEntry), 
+                    GetShaderDxilSize(guestShader->shaderCacheEntry), "main", RenderShaderFormat::DXIL);
             }
         }
 
@@ -6383,7 +6521,7 @@ static RenderShader* GetOrLinkShader(GuestShader* guestShader, uint32_t specCons
         s_dxcLinker->RegisterLibrary(specConstantsLibName, specConstantLibraryBlob.Get());
 
         wchar_t shaderLibName[0x100];
-        swprintf_s(shaderLibName, L"Shader_%d", guestShader->shaderCacheEntry->dxilOffset);
+        swprintf_s(shaderLibName, L"Shader_%d", GetShaderDxilOffset(guestShader->shaderCacheEntry));
 
         ComPtr<IDxcBlobEncoding> shaderLibraryBlob;
         {
@@ -6400,8 +6538,8 @@ static RenderShader* GetOrLinkShader(GuestShader* guestShader, uint32_t specCons
             }
 
             HRESULT hr = s_dxcUtils->CreateBlobFromPinned(
-                g_shaderCache.get() + guestShader->shaderCacheEntry->dxilOffset,
-                guestShader->shaderCacheEntry->dxilSize,
+                g_shaderCache.get() + GetShaderDxilOffset(guestShader->shaderCacheEntry),
+                GetShaderDxilSize(guestShader->shaderCacheEntry),
                 DXC_CP_ACP,
                 shaderLibraryBlob.GetAddressOf());
 
@@ -8374,13 +8512,16 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
         if (forceCubeMap)
             viewDesc.dimension = RenderTextureViewDimension::TEXTURE_CUBE;
 
+        RenderTextureViewDimension viewDimension = viewDesc.dimension;
+        viewDesc.dimension = GetShaderViewDimension(viewDimension);
+
         texture.textureView = texture.texture->createTextureView(viewDesc);
         texture.descriptorIndex = g_textureDescriptorAllocator.allocate();
         g_textureDescriptorSet->setTexture(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ, texture.textureView.get());
 
         texture.width = ddsDesc.width;
         texture.height = ddsDesc.height;
-        texture.viewDimension = viewDesc.dimension;
+        texture.viewDimension = viewDimension;
 
         struct Slice
         {
@@ -8484,7 +8625,7 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             texture.layout = RenderTextureLayout::COPY_DEST;
 
             texture.descriptorIndex = g_textureDescriptorAllocator.allocate();
-            g_textureDescriptorSet->setTexture(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ);
+            SetTexture2DDescriptor(texture.descriptorIndex, texture.texture, RenderFormat::R8G8B8A8_UNORM, texture.textureView);
 
             uint32_t rowPitch = (width * 4 + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
             uint32_t slicePitch = rowPitch * height;

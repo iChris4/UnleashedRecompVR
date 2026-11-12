@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -23,13 +24,13 @@ cbuffer SharedConstants : register(b2, space4)
 #endif
 
 float4 main(
-    in float4 iPos : SV_Position,
+    in float4 iPos : SV_Position VR_PS_EYE_INPUTS,
     in float4 iTexCoord0 : TEXCOORD0) : SV_Target0
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[s0_SamplerDescriptorIndex];
     
-    float4 color = texture.Sample(samplerState, iTexCoord0.xy);
+    float4 color = texture.Sample(samplerState, VR_SAMPLE_COORD(iTexCoord0.xy, VR_PS_EYE));
     
     if (any(or(iTexCoord0.xy < 0.0, iTexCoord0.xy > 1.0)))
         color = float4(0.0, 0.0, 0.0, 1.0);

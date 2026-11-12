@@ -1,8 +1,9 @@
 #include "copy_common.hlsli"
+#include "vr_stereo.hlsli"
 
-Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+VR_TEXTURE_2D(float4) g_Texture2DDescriptorHeap[] : register(t0, space0);
 
-float4 main(in float4 position : SV_Position) : SV_Target
+float4 main(in float4 position : SV_Position VR_PS_EYE_INPUTS) : SV_Target
 {
-    return g_Texture2DDescriptorHeap[g_PushConstants.ResourceDescriptorIndex].Load(int3(position.xy, 0));
+    return g_Texture2DDescriptorHeap[g_PushConstants.ResourceDescriptorIndex].Load(VR_LOAD_COORD(position.xy, VR_PS_EYE));
 }

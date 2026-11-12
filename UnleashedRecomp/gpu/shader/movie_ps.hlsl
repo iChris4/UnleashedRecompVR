@@ -2,11 +2,11 @@
 
 PixelShaderOutput main(in Interpolators In)
 {
-    Texture2D<float4> Tex0 = g_Texture2DDescriptorHeap[Tex0_ResourceDescriptorIndex];
-    Texture2D<float4> Tex1 = g_Texture2DDescriptorHeap[Tex1_ResourceDescriptorIndex];
-    Texture2D<float4> Tex2 = g_Texture2DDescriptorHeap[Tex2_ResourceDescriptorIndex];
-    Texture2D<float4> Tex3 = g_Texture2DDescriptorHeap[Tex3_ResourceDescriptorIndex];
-    Texture2D<float4> Tex4 = g_Texture2DDescriptorHeap[Tex4_ResourceDescriptorIndex];
+    VR_TEXTURE_2D(float4) Tex0 = g_Texture2DDescriptorHeap[Tex0_ResourceDescriptorIndex];
+    VR_TEXTURE_2D(float4) Tex1 = g_Texture2DDescriptorHeap[Tex1_ResourceDescriptorIndex];
+    VR_TEXTURE_2D(float4) Tex2 = g_Texture2DDescriptorHeap[Tex2_ResourceDescriptorIndex];
+    VR_TEXTURE_2D(float4) Tex3 = g_Texture2DDescriptorHeap[Tex3_ResourceDescriptorIndex];
+    VR_TEXTURE_2D(float4) Tex4 = g_Texture2DDescriptorHeap[Tex4_ResourceDescriptorIndex];
     
     SamplerState Tex0_s = g_SamplerDescriptorHeap[Tex0_SamplerDescriptorIndex];
     SamplerState Tex1_s = g_SamplerDescriptorHeap[Tex1_SamplerDescriptorIndex];
@@ -15,16 +15,16 @@ PixelShaderOutput main(in Interpolators In)
     SamplerState Tex4_s = g_SamplerDescriptorHeap[Tex4_SamplerDescriptorIndex];
     
     PixelShaderOutput Out;
-    float ValY = Tex0.Sample(Tex0_s, In.UV).r;
-    float ValU = Tex1.Sample(Tex1_s, In.UV).r - 0.5;
-    float ValV = Tex2.Sample(Tex2_s, In.UV).r - 0.5;
+    float ValY = Tex0.Sample(Tex0_s, VR_SAMPLE_COORD(In.UV, 0)).r;
+    float ValU = Tex1.Sample(Tex1_s, VR_SAMPLE_COORD(In.UV, 0)).r - 0.5;
+    float ValV = Tex2.Sample(Tex2_s, VR_SAMPLE_COORD(In.UV, 0)).r - 0.5;
     float ValA = 1.0;
     float ValD = 0.0;
     if (bAmv)
-        ValA = (Tex3.Sample(Tex3_s, In.UV).r - 0.0625) * 1.164;
+        ValA = (Tex3.Sample(Tex3_s, VR_SAMPLE_COORD(In.UV, 0)).r - 0.0625) * 1.164;
     if (bZmv)
     {
-        ValD = (Tex4.Sample(Tex4_s, In.UV).r - 0.0625) * 1.164;
+        ValD = (Tex4.Sample(Tex4_s, VR_SAMPLE_COORD(In.UV, 0)).r - 0.0625) * 1.164;
         if (ValD < 9.0 / 255.0)
         {
             ValD = 0.0;

@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 // VR: the UI texture as a quad on the HUD panel, for one eye. The panel
 // transform takes the canvas in normalised device coordinates to clip space:
@@ -20,8 +21,10 @@ cbuffer SharedConstants : register(b2, space4)
 
 #endif
 
-void main(in uint vertexId : SV_VertexID, out float4 position : SV_Position, out float2 texCoord : TEXCOORD)
+void main(in uint vertexId : SV_VertexID VR_VS_INSTANCE_INPUT, out float4 position : SV_Position VR_VS_EYE_OUTPUT, out float2 texCoord : TEXCOORD VR_VS_LAYER_OUTPUTS)
 {
+    VR_HOST_VS_EYE();
+
     const float2 corners[6] =
     {
         float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),

@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -40,9 +41,9 @@ float ComputeWeight(float x)
     return exp(-(x * x) / (2.0 * std * std)) / (std * sqrt(2.0 * PI));
 }
 
-float4 main(in float4 iPosition : SV_Position, in float4 iTexCoord0 : TEXCOORD0) : SV_Target
+float4 main(in float4 iPosition : SV_Position VR_PS_EYE_INPUTS, in float4 iTexCoord0 : TEXCOORD0) : SV_Target
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[s0_SamplerDescriptorIndex];
     
     float scale;
@@ -67,7 +68,7 @@ float4 main(in float4 iPosition : SV_Position, in float4 iTexCoord0 : TEXCOORD0)
         float2 offset = lerp(offsets[int(scaled)], offsets[min(int(scaled) + 1, 2)], frac(scaled));
         float offsetScale = 1.0 / 0.75;
         float weight = ComputeWeight(lerp(-offsetScale, offsetScale, step));
-        color += texture.SampleLevel(samplerState, iTexCoord0.xy + offset, 0) * weight;
+        color += texture.SampleLevel(samplerState, VR_SAMPLE_COORD(iTexCoord0.xy + offset, VR_PS_EYE), 0) * weight;
         weightSum += weight;
     }
     

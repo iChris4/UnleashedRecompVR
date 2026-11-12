@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -38,31 +39,31 @@ cbuffer SharedConstants : register(b2, space4)
 
 #endif
 
-float4 main(in float4 position : SV_Position, in float4 texCoord : TEXCOORD0) : SV_Target
+float4 main(in float4 position : SV_Position VR_PS_EYE_INPUTS, in float4 texCoord : TEXCOORD0) : SV_Target
 {
-    Texture2D<float4> sampColor = g_Texture2DDescriptorHeap[sampColor_Texture2DDescriptorIndex];
-    Texture2D<float4> sampVelocityMap = g_Texture2DDescriptorHeap[sampVelocityMap_Texture2DDescriptorIndex];
-    Texture2D<float4> sampZBuffer = g_Texture2DDescriptorHeap[sampZBuffer_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) sampColor = g_Texture2DDescriptorHeap[sampColor_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) sampVelocityMap = g_Texture2DDescriptorHeap[sampVelocityMap_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) sampZBuffer = g_Texture2DDescriptorHeap[sampZBuffer_Texture2DDescriptorIndex];
     
     SamplerState sampColor_s = g_SamplerDescriptorHeap[sampColor_SamplerDescriptorIndex]; 
     SamplerState sampVelocityMap_s = g_SamplerDescriptorHeap[sampVelocityMap_SamplerDescriptorIndex];   
     SamplerState sampZBuffer_s = g_SamplerDescriptorHeap[sampZBuffer_SamplerDescriptorIndex];
     
-    float depth = sampZBuffer.SampleLevel(sampZBuffer_s, texCoord.xy, 0).x;
-    float4 velocityMap = sampVelocityMap.SampleLevel(sampVelocityMap_s, texCoord.xy, 0);
+    float depth = sampZBuffer.SampleLevel(sampZBuffer_s, VR_SAMPLE_COORD(texCoord.xy, VR_PS_EYE), 0).x;
+    float4 velocityMap = sampVelocityMap.SampleLevel(sampVelocityMap_s, VR_SAMPLE_COORD(texCoord.xy, VR_PS_EYE), 0);
     float2 velocity = (velocityMap.xz + velocityMap.yw / 255.0) * 2.0 - 1.0;
 
     int sampleCount = min(64, round(length(velocity * g_ViewportSize.xy)));
     float2 sampleOffset = velocity / (float) sampleCount;
 
-    float3 color = sampColor.SampleLevel(sampColor_s, texCoord.xy, 0).rgb;
+    float3 color = sampColor.SampleLevel(sampColor_s, VR_SAMPLE_COORD(texCoord.xy, VR_PS_EYE), 0).rgb;
     int count = 1;
 
     for (int i = 1; i <= sampleCount; i++)
     {
         float2 sampleCoord = texCoord.xy + sampleOffset * i;
-        float3 sampleColor = sampColor.SampleLevel(sampColor_s, sampleCoord, 0).rgb;
-        float sampleDepth = sampZBuffer.SampleLevel(sampZBuffer_s, sampleCoord, 0).x;
+        float3 sampleColor = sampColor.SampleLevel(sampColor_s, VR_SAMPLE_COORD(sampleCoord, VR_PS_EYE), 0).rgb;
+        float sampleDepth = sampZBuffer.SampleLevel(sampZBuffer_s, VR_SAMPLE_COORD(sampleCoord, VR_PS_EYE), 0).x;
 
         if (sampleDepth - depth < 0.01)
         {

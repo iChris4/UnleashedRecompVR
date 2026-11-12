@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -59,6 +60,7 @@ struct VertexShaderInput
 struct Interpolators
 {
     float4 ProjPos : SV_Position;
+    VR_INTERPOLATORS
     float2 UV : TEXCOORD0;
 };
 

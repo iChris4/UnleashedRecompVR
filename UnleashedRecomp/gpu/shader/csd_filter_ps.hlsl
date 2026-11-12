@@ -1,4 +1,5 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+#include "vr_stereo.hlsli"
 
 #ifdef __spirv__
 
@@ -17,15 +18,14 @@ cbuffer SharedConstants : register(b2, space4)
 #endif
 
 float4 main(
-	in float4 iPosition : SV_Position,
+	in float4 iPosition : SV_Position VR_PS_EYE_INPUTS,
 	in float4 iTexCoord0 : TEXCOORD0,
 	in float4 iTexCoord1 : TEXCOORD1) : SV_Target
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
+    VR_TEXTURE_2D(float4) texture = g_Texture2DDescriptorHeap[s0_Texture2DDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[s0_SamplerDescriptorIndex];
     
-    uint2 dimensions;
-    texture.GetDimensions(dimensions.x, dimensions.y);
+    uint2 dimensions = getTexture2DDimensions(texture);
     
     // https://www.shadertoy.com/view/csX3RH
     float2 uvTexspace = iTexCoord1.xy * dimensions;
@@ -34,7 +34,7 @@ float4 main(
     uvTexspace = clamp(uvTexspace, seam - 0.5, seam + 0.5);
     float2 texCoord = uvTexspace / dimensions;
     
-    float4 color = texture.Sample(samplerState, texCoord);
+    float4 color = texture.Sample(samplerState, VR_SAMPLE_COORD(texCoord, VR_PS_EYE));
     color *= iTexCoord0;
     
     // The game enables alpha test for CSD, but the alpha threshold doesn't seem to be assigned anywhere? Weird.
