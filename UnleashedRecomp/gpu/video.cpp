@@ -69,6 +69,8 @@
 #include "shader/resolve_msaa_depth_4x.hlsl.dxil.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.dxil.h"
 #include "shader/xr_blit_ps.hlsl.dxil.h"
+#include "shader/xr_ui_ps.hlsl.dxil.h"
+#include "shader/xr_ui_vs.hlsl.dxil.h"
 #endif
 
 #include "shader/blend_color_alpha_ps.hlsl.spirv.h"
@@ -95,6 +97,8 @@
 #include "shader/resolve_msaa_depth_4x.hlsl.spirv.h"
 #include "shader/resolve_msaa_depth_8x.hlsl.spirv.h"
 #include "shader/xr_blit_ps.hlsl.spirv.h"
+#include "shader/xr_ui_ps.hlsl.spirv.h"
+#include "shader/xr_ui_vs.hlsl.spirv.h"
 
 #ifdef _WIN32
 extern "C"
@@ -174,7 +178,17 @@ struct SharedConstants
     float halfPixelOffsetX{};
     float halfPixelOffsetY{};
     float alphaThreshold{};
+
+    // VR: read by the CSD (HUD) vertex shaders only. When enabled, the HUD's
+    // canvas coordinates go on a panel in front of the game camera: clip =
+    // [x, y, 0, 1] * vrHudMatrix for the eye being drawn (register c18).
+    uint32_t padding0[3]{};
+    float vrHudMatrix[16]{};
+    uint32_t vrHudEnabled{};
 };
+
+static_assert(offsetof(SharedConstants, vrHudMatrix) == 288);
+static_assert(offsetof(SharedConstants, vrHudEnabled) == 352);
 
 // Depth bias values here are only used when the render device has 
 // dynamic depth bias capability enabled. Otherwise, they get unused
@@ -1092,12 +1106,54 @@ struct VREyeState
 {
     float projectionTerms[4];
     XrMatrix eyeFromView;
+
+    // The HUD canvas (normalised device coordinates) on a panel in front of the
+    // game camera, as this eye sees it: clip = [x, y, 0, 1] * hudMatrix.
+    XrMatrix hudMatrix;
 };
+
+// The UI drawn with ImGui in stereo frames: drawn once into this texture during
+// the left eye's pass, then put on the HUD panel in each eye.
+static std::unique_ptr<RenderTexture> g_vrUiTexture;
+static std::unique_ptr<RenderFramebuffer> g_vrUiFramebuffer;
+static uint32_t g_vrUiTextureDescriptorIndex;
+static std::unique_ptr<RenderPipeline> g_vrUiCompositePipeline;
+static bool g_vrUiUsed;
+
+// The next draw is on the HUD panel (a CSD draw or a 2D primitive moved there):
+// set just before FlushRenderStateForRenderThread, which consumes it. While the
+// current draw is on the panel, the game's scissor rectangle is moved onto the
+// panel with it.
+static bool g_vrNextDrawOnPanel;
+static bool g_vrScissorOnPanel;
 
 static bool g_vrViewsLatched;
 static VRViews g_vrViews;
 static VREyeState g_vrEyes[2];
 static uint32_t g_vrCameraDrawCount;
+
+// A camera looking at the world through a planar mirror, as the reflection map
+// is drawn: world to clip is R * L * S, where R is world to the mirrored view (a
+// rigid transform with a mirror in it), L a perspective lens, and S an optional
+// vertical image flip (the water shaders read the map upside down). Wherever the
+// game puts the mirror (view, projection, or a reflected camera with its image
+// flipped), the product has this form; DecomposeVRReflection recovers R and L.
+struct VRReflection
+{
+    XrMatrix mirroredView;
+    float lensX;
+    float lensY;
+    float offsetX;
+    float offsetY;
+    bool flipped;
+
+    // The depth column of world to clip is not the lens's: a clip plane at the
+    // water (an oblique near plane), kept as is. Otherwise the lens's depth terms.
+    bool oblique;
+    float depthScale;
+    float depthOffset;
+    float depthColumn[4];
+};
 
 // How the left eye's draws were classified, logged every few seconds.
 struct VRDrawStatistics
@@ -1110,16 +1166,111 @@ struct VRDrawStatistics
     uint32_t noTarget;
     uint32_t noViews;
     uint32_t accepted;
+    uint32_t acceptedSameLens;
+
+    // Reflection draws given per-eye cameras (into the reflection map, or with a
+    // mirror in a projection using the main lens).
+    uint32_t reflectionPerEye;
+    uint32_t reflectionFlipped;
+    uint32_t reflectionOblique;
+
+    // The reflection map: draws reading it, the size of the texture they read,
+    // whether that texture was resolved from the target being drawn, and the
+    // draws into the surface it is resolved from.
+    uint32_t reflectionMapReads;
+    uint32_t reflectionMapUnresolved;
+    uint32_t reflectionMapSelf;
+    uint32_t reflectionMapWidth;
+    uint32_t reflectionMapHeight;
+    uint32_t reflectionMapDraws;
+    uint32_t reflectionMapNoCamera;
+    uint32_t reflectionMapNotMirrored;
+
+    // The first draw into the reflection map and the first scene-sized camera
+    // draw of the period, logged with their matrices.
+    bool reflectionSampleTaken;
+    bool reflectionSampleDecomposed;
+    uint64_t reflectionSampleShader;
+    float reflectionSampleProjection[16];
+    float reflectionSampleView[16];
+    VRReflection reflectionSample;
+    bool mainSampleTaken;
+    float mainSampleProjection[16];
+    float mainSampleView[16];
+
     uint32_t lastOtherWidth;
     uint32_t lastOtherHeight;
+    float lastOtherProjectionX;
+    float lastOtherProjectionY;
+    uint32_t lastNotPerspectiveWidth;
+    uint32_t lastNotPerspectiveHeight;
+    float lastNotPerspective23;
+    float lastNotPerspective33;
+
+    // Boost blur passes left without their effect.
+    uint32_t boostPassesNeutralised;
+
+    // Persistent bloom passes given this frame's bloom for the previous one, the
+    // game's persistence factor, and how often the previous one had been
+    // resolved from the pass's own target (the feedback loop).
+    uint32_t bloomFeedbackReplaced;
+    float lastBloomPersistence;
+    uint32_t bloomHistoryFromOwnTarget;
+
+    // Light shaft passes, how many had the light behind the left eye, and the
+    // last light position on screen, as the game gave it and for the left eye.
+    uint32_t lightShaftPasses;
+    uint32_t lightShaftsBehind;
+    float lastLightShaftGame[2];
+    float lastLightShaftEye[2];
+
+    // 2D draws into the back buffer by other shaders than the HUD's.
+    uint32_t twoDOnPanel;
+    uint32_t twoDFullScreen;
+    uint32_t twoDUnhandled;
+    uint64_t lastUnhandledShader;
+    uint32_t lastUnhandledStride;
+    uint32_t lastUnhandledPositionType;
+    const char* lastUnhandledReason;
 };
 
 static VRDrawStatistics g_vrStatistics;
 
-// What the last uploaded constants were rewritten for: the shader of a camera
-// draw, or null. A change forces a new upload.
+// The main camera's lens (the absolute frustum scales of its projection), from
+// the scene-sized camera draws. Other targets drawn with the same lens (planar
+// reflections) are drawn per eye too.
+static bool g_vrMainLensValid;
+static bool g_vrMainLensSeenThisFrame;
+static float g_vrMainLensX;
+static float g_vrMainLensY;
+
+// The surface the reflection map (g_ReflectionMapSampler) was last resolved from,
+// as the left eye's draws read it, and its value latched at the start of the
+// frame so that both eyes classify the same draws alike. Compared by address only.
+static GuestSurface* g_vrReflectionSurfaceSeen;
+static GuestSurface* g_vrReflectionSurface;
+
+// How a draw's constants are rewritten for the eye being drawn.
+enum class VRDrawKind
+{
+    None,
+
+    // Through the game camera: per-eye view and projection.
+    Camera,
+
+    // A planar reflection with the mirror folded into the projection: per-eye
+    // projection around the mirror, view kept.
+    Reflection
+};
+
+// What the last uploaded constants were rewritten for: the shader and kind of a
+// camera draw, the pixel shader of a neutralised boost or bloom pass, or null,
+// and whether the shared constants had the bloom feedback texture replaced. A
+// change forces a new upload.
 static GuestShader* g_vrVertexPatchShader;
+static VRDrawKind g_vrVertexPatchKind;
 static GuestShader* g_vrPixelPatchShader;
+static bool g_vrSharedPatch;
 
 static void RecordVRCommand(const RenderCommand& cmd)
 {
@@ -1178,8 +1329,15 @@ static void BeginVRFrame()
     g_vrViews = {};
     g_vrCameraDrawCount = 0;
     g_vrVertexPatchShader = nullptr;
+    g_vrVertexPatchKind = VRDrawKind::None;
     g_vrPixelPatchShader = nullptr;
+    g_vrSharedPatch = false;
     g_vrFrameResult = {};
+    g_vrUiUsed = false;
+    g_vrNextDrawOnPanel = false;
+    g_vrScissorOnPanel = false;
+    g_vrMainLensSeenThisFrame = false;
+    g_vrReflectionSurface = g_vrReflectionSurfaceSeen;
 
     g_vrSnapshot.viewport = g_viewport;
     g_vrSnapshot.pipelineState = g_pipelineState;
@@ -1226,7 +1384,11 @@ static void RestoreVRFrameStart(GuestSurface* backBuffer)
 
     g_dirtyStates = DirtyStates(true);
     g_vrVertexPatchShader = nullptr;
+    g_vrVertexPatchKind = VRDrawKind::None;
     g_vrPixelPatchShader = nullptr;
+    g_vrSharedPatch = false;
+    g_vrNextDrawOnPanel = false;
+    g_vrScissorOnPanel = false;
 
     // The output pass and ImGui bound their own layouts and descriptors.
     FlushBarriers();
@@ -1249,12 +1411,264 @@ static void LatchVRViews()
 
     float unitsPerMeter = std::clamp(Config::VRWorldScale.Value, 0.001f, 1000.0f);
 
+    // The HUD panel: the canvas's shape, VRHudWidth wide, VRHudDistance ahead of
+    // the game camera (row vectors: [x, y, 0, 1] * panel = view-space point).
+    float aspectRatio = float(Video::s_viewportWidth) / float(std::max(1u, Video::s_viewportHeight));
+    float halfWidth = 0.5f * std::max(0.1f, Config::VRHudWidth.Value) * unitsPerMeter;
+
+    XrMatrix panel = XrMatrixIdentity();
+    panel.m[0] = halfWidth;
+    panel.m[5] = halfWidth / aspectRatio;
+    panel.m[14] = -std::max(0.1f, Config::VRHudDistance.Value) * unitsPerMeter;
+
     for (size_t i = 0; i < 2; i++)
     {
         const VRViews::Eye& eye = g_vrViews.eyes[i];
-        XrProjectionFrustumTerms(eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown, g_vrEyes[i].projectionTerms);
-        g_vrEyes[i].eyeFromView = XrMatrixEyeFromView(eye.orientation, eye.position, unitsPerMeter);
+        VREyeState& eyeState = g_vrEyes[i];
+        XrProjectionFrustumTerms(eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown, eyeState.projectionTerms);
+        eyeState.eyeFromView = XrMatrixEyeFromView(eye.orientation, eye.position, unitsPerMeter);
+
+        // Only x, y and w matter: the HUD keeps its own depth.
+        XrMatrix projection{};
+        projection.m[0] = eyeState.projectionTerms[0];
+        projection.m[5] = eyeState.projectionTerms[1];
+        projection.m[8] = eyeState.projectionTerms[2];
+        projection.m[9] = eyeState.projectionTerms[3];
+        projection.m[11] = -1.0f;
+
+        eyeState.hudMatrix = XrMatrixMultiply(XrMatrixMultiply(panel, eyeState.eyeFromView), projection);
     }
+}
+
+// The frame is shown in stereo (so far, during the left eye's pass).
+static bool IsVRFrameImmersive()
+{
+    return g_vrPass >= 0 && g_vrViews.valid && g_vrCameraDrawCount > 0;
+}
+
+static void SetVRHudOnPanel(bool onPanel)
+{
+    if (onPanel)
+    {
+        const float* matrix = g_vrEyes[g_vrPass].hudMatrix.m;
+        if (memcmp(g_sharedConstants.vrHudMatrix, matrix, sizeof(g_sharedConstants.vrHudMatrix)) != 0)
+        {
+            memcpy(g_sharedConstants.vrHudMatrix, matrix, sizeof(g_sharedConstants.vrHudMatrix));
+            g_dirtyStates.sharedConstants = true;
+        }
+    }
+
+    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.vrHudEnabled, uint32_t(onPanel));
+    g_vrNextDrawOnPanel = onPanel;
+}
+
+// The game's scissor rectangle (render-target pixels over the 2D canvas the
+// viewport covers) for a draw moved onto the HUD panel: its corners go through
+// the eye's panel matrix, and the result is their bounding box. A tilted head
+// makes the box a little larger than the moved rectangle.
+static RenderRect GetVRPanelScissorRect()
+{
+    RenderRect viewportRect(
+        int32_t(g_viewport.x),
+        int32_t(g_viewport.y),
+        int32_t(g_viewport.x + g_viewport.width),
+        int32_t(g_viewport.y + g_viewport.height));
+
+    if (g_vrPass < 0 || g_viewport.width <= 0.0f || g_viewport.height <= 0.0f)
+        return viewportRect;
+
+    const float* matrix = g_vrEyes[g_vrPass].hudMatrix.m;
+    float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+
+    for (int32_t corner = 0; corner < 4; corner++)
+    {
+        float pixelX = float((corner & 1) != 0 ? g_scissorRect.right : g_scissorRect.left);
+        float pixelY = float((corner & 2) != 0 ? g_scissorRect.bottom : g_scissorRect.top);
+        float x = (pixelX - g_viewport.x) / g_viewport.width * 2.0f - 1.0f;
+        float y = 1.0f - (pixelY - g_viewport.y) / g_viewport.height * 2.0f;
+
+        float clipX = x * matrix[0] + y * matrix[4] + matrix[12];
+        float clipY = x * matrix[1] + y * matrix[5] + matrix[13];
+        float clipW = x * matrix[3] + y * matrix[7] + matrix[15];
+
+        // A corner behind the eye: the panel is out of view anyway.
+        if (clipW <= 1.0e-4f)
+            return viewportRect;
+
+        float panelX = g_viewport.x + (clipX / clipW + 1.0f) * 0.5f * g_viewport.width;
+        float panelY = g_viewport.y + (1.0f - clipY / clipW) * 0.5f * g_viewport.height;
+        minX = std::min(minX, panelX);
+        minY = std::min(minY, panelY);
+        maxX = std::max(maxX, panelX);
+        maxY = std::max(maxY, panelY);
+    }
+
+    RenderRect rect(
+        std::clamp(int32_t(std::floor(minX)), viewportRect.left, viewportRect.right),
+        std::clamp(int32_t(std::floor(minY)), viewportRect.top, viewportRect.bottom),
+        std::clamp(int32_t(std::ceil(maxX)), viewportRect.left, viewportRect.right),
+        std::clamp(int32_t(std::ceil(maxY)), viewportRect.top, viewportRect.bottom));
+
+    return rect;
+}
+
+static void NoteVRUnhandled2D(GuestShader* shader, uint32_t stride, uint32_t positionType, const char* reason)
+{
+    if (g_vrPass != 0)
+        return;
+
+    ++g_vrStatistics.twoDUnhandled;
+    g_vrStatistics.lastUnhandledShader = (shader != nullptr && shader->shaderCacheEntry != nullptr) ? shader->shaderCacheEntry->hash : 0;
+    g_vrStatistics.lastUnhandledStride = stride;
+    g_vrStatistics.lastUnhandledPositionType = positionType;
+    g_vrStatistics.lastUnhandledReason = reason;
+}
+
+// VR: a 2D draw into the back buffer by a shader of the game's own (menu text,
+// loading screens, the debug primitives) whose vertices are already in
+// normalised device coordinates: in stereo frames its uploaded vertices are
+// moved onto the HUD panel for the eye being drawn, unless it covers the
+// whole screen. `uploaded` is the little-endian copy the GPU reads,
+// `vertices` the game's big-endian data. Returns whether the draw was moved.
+//
+// A float4 position gets the panel's perspective in its w. A float3 one (the
+// shader supplies w = 1, as FxFilterT does) gets the divided position, so its
+// texture coordinates interpolate without perspective across the panel: fine
+// for a panel seen nearly face-on.
+static bool PlaceVR2DPrimitiveOnPanel(const uint8_t* vertices, uint8_t* uploaded, uint32_t size, uint32_t stride)
+{
+    GuestShader* vertexShader = g_pipelineState.vertexShader;
+    if (g_renderTarget != g_backBuffer || vertexShader == nullptr || vertexShader->vrProjectionRegister >= 0 || vertexShader->vrHudShader)
+        return false;
+
+    GuestVertexDeclaration* declaration = g_pipelineState.vertexDeclaration;
+    if (declaration == nullptr || stride < 12)
+    {
+        NoteVRUnhandled2D(vertexShader, stride, 0, "no declaration");
+        return false;
+    }
+
+    uint32_t positionOffset = UINT32_MAX;
+    uint32_t positionType = 0;
+
+    for (uint32_t i = 0; i < declaration->vertexElementCount; i++)
+    {
+        const GuestVertexElement& element = declaration->vertexElements[i];
+        if (element.stream == 0xFF)
+            break;
+
+        if (element.stream == 0 && element.usage == D3DDECLUSAGE_POSITION && element.usageIndex == 0)
+        {
+            positionOffset = element.offset;
+            positionType = element.type;
+            break;
+        }
+    }
+
+    bool hasW = (positionType == D3DDECLTYPE_FLOAT4);
+    uint32_t positionSize = hasW ? 16 : 12;
+
+    if (positionOffset == UINT32_MAX || (!hasW && positionType != D3DDECLTYPE_FLOAT3) || positionOffset + positionSize > stride)
+    {
+        NoteVRUnhandled2D(vertexShader, stride, positionType, "position not float3 or float4");
+        return false;
+    }
+
+    auto loadFloat = [&](uint32_t offset)
+        {
+            return std::bit_cast<float>(ByteSwap(*reinterpret_cast<const uint32_t*>(vertices + offset)));
+        };
+
+    float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+
+    for (uint32_t offset = positionOffset; offset + positionSize <= size; offset += stride)
+    {
+        float x = loadFloat(offset);
+        float y = loadFloat(offset + 4);
+        float w = hasW ? loadFloat(offset + 12) : 1.0f;
+
+        if (std::abs(x) > 1.05f || std::abs(y) > 1.05f || std::abs(w - 1.0f) > 0.01f)
+        {
+            NoteVRUnhandled2D(vertexShader, stride, positionType, "not normalised");
+            return false;
+        }
+
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+        maxX = std::max(maxX, x);
+        maxY = std::max(maxY, y);
+    }
+
+    if (minX <= -0.99f && minY <= -0.99f && maxX >= 0.99f && maxY >= 0.99f)
+    {
+        if (g_vrPass == 0)
+            ++g_vrStatistics.twoDFullScreen;
+
+        return false;
+    }
+
+    const float* matrix = g_vrEyes[g_vrPass].hudMatrix.m;
+
+    for (uint32_t offset = positionOffset; offset + positionSize <= size; offset += stride)
+    {
+        float x = loadFloat(offset);
+        float y = loadFloat(offset + 4);
+        float z = loadFloat(offset + 8);
+
+        // [x, y, 0, 1] * matrix; the depth keeps its own value.
+        float clipX = x * matrix[0] + y * matrix[4] + matrix[12];
+        float clipY = x * matrix[1] + y * matrix[5] + matrix[13];
+        float clipW = x * matrix[3] + y * matrix[7] + matrix[15];
+
+        float* position = reinterpret_cast<float*>(uploaded + offset);
+
+        if (hasW)
+        {
+            position[0] = clipX;
+            position[1] = clipY;
+            position[2] = z * clipW;
+            position[3] = clipW;
+        }
+        else
+        {
+            // Behind the eye the panel is out of view; keep the vertex off screen.
+            float inverseW = clipW > 1.0e-4f ? 1.0f / clipW : 0.0f;
+            position[0] = clipW > 1.0e-4f ? clipX * inverseW : 2.0f;
+            position[1] = clipW > 1.0e-4f ? clipY * inverseW : 2.0f;
+            position[2] = z;
+        }
+    }
+
+    if (g_vrPass == 0)
+        ++g_vrStatistics.twoDOnPanel;
+
+    return true;
+}
+
+// Whether a CSD draw covers the whole canvas (a screen fade, a dimmed
+// background): those stay over the whole view rather than going on the panel.
+// Positions are the first two (big-endian) floats of each vertex, in the pixels
+// of the viewport size the CSD vertex shader divides by (register c180).
+static bool CoversVRHudCanvas(const uint8_t* vertices, uint32_t size, uint32_t stride)
+{
+    float canvasWidth = LoadGuestConstant(g_vertexShaderConstants, 180 * 4 + 0);
+    float canvasHeight = LoadGuestConstant(g_vertexShaderConstants, 180 * 4 + 1);
+    if (stride < 8 || size < stride || canvasWidth <= 0.0f || canvasHeight <= 0.0f)
+        return false;
+
+    float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+
+    for (uint32_t offset = 0; offset + 8 <= size; offset += stride)
+    {
+        float x = std::bit_cast<float>(ByteSwap(*reinterpret_cast<const uint32_t*>(vertices + offset)));
+        float y = std::bit_cast<float>(ByteSwap(*reinterpret_cast<const uint32_t*>(vertices + offset + 4)));
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+        maxX = std::max(maxX, x);
+        maxY = std::max(maxY, y);
+    }
+
+    return minX <= 1.0f && minY <= 1.0f && maxX >= canvasWidth - 1.0f && maxY >= canvasHeight - 1.0f;
 }
 
 // The scene's internal resolution, as the SetResolution hook gives it to the game.
@@ -1264,39 +1678,281 @@ static void GetVRSceneSize(int32_t& width, int32_t& height)
     height = int32_t(round(Video::s_viewportHeight * Config::ResolutionScale));
 }
 
+static float DotVR3(const float* a, const float* b)
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// Splits world to clip into the parts of VRReflection. The lens's w column is
+// minus R's third column, and its x and y columns are R's first two scaled by the
+// lens (plus an offset along the third), so R and the lens follow from those
+// three columns; R's last column is (0, 0, 0, 1). Shadow maps (orthographic: no
+// w column) and anything that is not a rigid camera do not decompose. A rigid R
+// with a positive determinant holds no mirror: the image flip is then taken to
+// be vertical and in the lens, as the water shaders' upside-down reads imply.
+static bool DecomposeVRReflection(const XrMatrix& worldToClip, VRReflection& reflection)
+{
+    float x[4], y[4], z[4], w[4];
+    for (size_t row = 0; row < 4; row++)
+    {
+        x[row] = worldToClip.m[row * 4 + 0];
+        y[row] = worldToClip.m[row * 4 + 1];
+        z[row] = worldToClip.m[row * 4 + 2];
+        w[row] = worldToClip.m[row * 4 + 3];
+    }
+
+    // A homogeneous scale changes nothing: make the w column's axis a unit vector.
+    float scale = sqrtf(DotVR3(w, w));
+    if (!(scale > 1e-6f))
+        return false;
+
+    float axisX[4], axisY[4], axisZ[4];
+    for (size_t row = 0; row < 4; row++)
+    {
+        x[row] /= scale;
+        y[row] /= scale;
+        z[row] /= scale;
+        axisZ[row] = -w[row] / scale;
+    }
+
+    reflection.offsetX = DotVR3(x, axisZ);
+    reflection.offsetY = DotVR3(y, axisZ);
+    for (size_t row = 0; row < 4; row++)
+    {
+        axisX[row] = x[row] - reflection.offsetX * axisZ[row];
+        axisY[row] = y[row] - reflection.offsetY * axisZ[row];
+    }
+
+    reflection.lensX = sqrtf(DotVR3(axisX, axisX));
+    reflection.lensY = sqrtf(DotVR3(axisY, axisY));
+    if (!(reflection.lensX > 0.05f && reflection.lensX < 50.0f && reflection.lensY > 0.05f && reflection.lensY < 50.0f))
+        return false;
+
+    for (size_t row = 0; row < 4; row++)
+    {
+        axisX[row] /= reflection.lensX;
+        axisY[row] /= reflection.lensY;
+    }
+
+    if (std::abs(DotVR3(axisX, axisY)) > 0.02f)
+        return false;
+
+    float axisYCrossZ[3] =
+    {
+        axisY[1] * axisZ[2] - axisY[2] * axisZ[1],
+        axisY[2] * axisZ[0] - axisY[0] * axisZ[2],
+        axisY[0] * axisZ[1] - axisY[1] * axisZ[0]
+    };
+
+    reflection.flipped = DotVR3(axisX, axisYCrossZ) > 0.0f;
+    if (reflection.flipped)
+    {
+        for (float& value : axisY)
+            value = -value;
+
+        reflection.offsetY = -reflection.offsetY;
+    }
+
+    for (size_t row = 0; row < 4; row++)
+    {
+        reflection.mirroredView.m[row * 4 + 0] = axisX[row];
+        reflection.mirroredView.m[row * 4 + 1] = axisY[row];
+        reflection.mirroredView.m[row * 4 + 2] = axisZ[row];
+        reflection.mirroredView.m[row * 4 + 3] = (row == 3) ? 1.0f : 0.0f;
+    }
+
+    reflection.depthScale = DotVR3(z, axisZ);
+    reflection.depthOffset = z[3] - reflection.depthScale * axisZ[3];
+
+    float residual[3] =
+    {
+        z[0] - reflection.depthScale * axisZ[0],
+        z[1] - reflection.depthScale * axisZ[1],
+        z[2] - reflection.depthScale * axisZ[2]
+    };
+
+    reflection.oblique = sqrtf(DotVR3(residual, residual)) > 1e-3f + 0.01f * std::abs(reflection.depthScale);
+    memcpy(reflection.depthColumn, z, sizeof(z));
+    return true;
+}
+
+// World to clip of the current draw, from its vertex shader's view and projection.
+static bool GetVRWorldToClip(const GuestShader* vertexShader, XrMatrix& view, XrMatrix& projection, XrMatrix& worldToClip)
+{
+    if (vertexShader == nullptr || vertexShader->vrProjectionRegister < 0 || vertexShader->vrViewRegister < 0 || vertexShader->vrViewRegisterCount != 4)
+        return false;
+
+    view = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrViewRegister);
+    projection = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrProjectionRegister);
+    worldToClip = XrMatrixMultiply(view, projection);
+    return true;
+}
+
+static void CountVRReflection(const VRReflection& reflection)
+{
+    ++g_vrStatistics.reflectionPerEye;
+
+    if (reflection.flipped)
+        ++g_vrStatistics.reflectionFlipped;
+
+    if (reflection.oblique)
+        ++g_vrStatistics.reflectionOblique;
+}
+
+// A draw into the reflection map's surface: a reflection draw when its camera
+// decomposes (see VRReflection), whatever its projection looks like. The first
+// one of each logging period is kept for the log, with the engine's projection
+// and view registers (c0, c4) when the shader declares neither.
+static VRDrawKind GetVRReflectionMapDrawKind(GuestShader* vertexShader, bool leftEye)
+{
+    XrMatrix view{}, projection{}, worldToClip{};
+    VRReflection reflection{};
+    bool hasCamera = GetVRWorldToClip(vertexShader, view, projection, worldToClip);
+    bool decomposed = hasCamera && DecomposeVRReflection(worldToClip, reflection);
+
+    if (leftEye)
+    {
+        VRDrawStatistics& s = g_vrStatistics;
+        ++s.reflectionMapDraws;
+
+        if (!hasCamera)
+            ++s.reflectionMapNoCamera;
+        else if (!decomposed)
+            ++s.reflectionMapNotMirrored;
+
+        if (!s.reflectionSampleTaken)
+        {
+            if (!hasCamera)
+            {
+                projection = LoadGuestMatrix(g_vertexShaderConstants, 0);
+                view = LoadGuestMatrix(g_vertexShaderConstants, 4);
+            }
+
+            s.reflectionSampleTaken = true;
+            s.reflectionSampleDecomposed = decomposed;
+            s.reflectionSampleShader = (vertexShader != nullptr && vertexShader->shaderCacheEntry != nullptr) ? vertexShader->shaderCacheEntry->hash : 0;
+            memcpy(s.reflectionSampleProjection, projection.m, sizeof(projection.m));
+            memcpy(s.reflectionSampleView, view.m, sizeof(view.m));
+            s.reflectionSample = reflection;
+        }
+    }
+
+    if (!decomposed)
+        return VRDrawKind::None;
+
+    if (!g_vrViewsLatched)
+        LatchVRViews();
+
+    if (leftEye)
+    {
+        if (g_vrViews.valid)
+            CountVRReflection(reflection);
+        else
+            ++g_vrStatistics.noViews;
+    }
+
+    return g_vrViews.valid ? VRDrawKind::Reflection : VRDrawKind::None;
+}
+
+// Remembers the surface the reflection map read by the current draw was drawn
+// into, so that the next frames draw into it per eye. A map resolved from the
+// target being drawn would be the scene itself and is ignored.
+static void NoteVRReflectionMapRead(GuestSurface* renderTarget)
+{
+    GuestShader* pixelShader = g_pipelineState.pixelShader;
+    if (pixelShader == nullptr || pixelShader->vrReflectionSamplerRegister < 0)
+        return;
+
+    ++g_vrStatistics.reflectionMapReads;
+
+    GuestTexture* texture = g_textures[pixelShader->vrReflectionSamplerRegister];
+    if (texture == nullptr || texture->vrResolvedFrom == nullptr)
+    {
+        ++g_vrStatistics.reflectionMapUnresolved;
+        return;
+    }
+
+    g_vrStatistics.reflectionMapWidth = texture->width;
+    g_vrStatistics.reflectionMapHeight = texture->height;
+
+    if (texture->vrResolvedFrom == renderTarget)
+    {
+        ++g_vrStatistics.reflectionMapSelf;
+        return;
+    }
+
+    g_vrReflectionSurfaceSeen = texture->vrResolvedFrom;
+}
+
 // A draw through the game camera: its vertex shader reads the camera's
 // projection and view, the projection is a perspective one, and it renders into
 // the scene's targets (full, half or quarter resolution, within 3% for any
-// alignment the game applies) rather than a shadow map, a cube map or another
-// target with a camera of its own.
-static bool IsVRCameraDraw(GuestSurface* renderTarget, GuestSurface* depthStencil)
+// alignment the game applies) or uses the main camera's lens (a planar
+// reflection), rather than a shadow map, a cube map or another target with a
+// camera of its own. Draws into the reflection map, and draws whose projection
+// folds a mirror into the main camera's lens, are reflection draws.
+static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthStencil)
 {
     GuestShader* vertexShader = g_pipelineState.vertexShader;
-    if (vertexShader == nullptr || vertexShader->vrProjectionRegister < 0 || vertexShader->vrViewRegister < 0)
-        return false;
-
     bool leftEye = (g_vrPass == 0);
+
+    if (g_vrReflectionSurface != nullptr && renderTarget == g_vrReflectionSurface)
+        return GetVRReflectionMapDrawKind(vertexShader, leftEye);
+
+    if (vertexShader == nullptr || vertexShader->vrProjectionRegister < 0 || vertexShader->vrViewRegister < 0)
+        return VRDrawKind::None;
+
     if (leftEye)
         ++g_vrStatistics.cameraShaderDraws;
+
+    GuestSurface* surface = renderTarget != nullptr ? renderTarget : depthStencil;
 
     size_t projection = size_t(vertexShader->vrProjectionRegister) * 4;
     float projection23 = LoadGuestConstant(g_vertexShaderConstants, projection + 11);
     float projection33 = LoadGuestConstant(g_vertexShaderConstants, projection + 15);
     if (std::abs(projection23 + 1.0f) > 0.001f || std::abs(projection33) > 0.001f)
     {
-        if (leftEye)
-            ++g_vrStatistics.notPerspective;
+        XrMatrix view, gameProjection, worldToClip;
+        VRReflection reflection;
 
-        return false;
+        if (g_vrMainLensValid &&
+            GetVRWorldToClip(vertexShader, view, gameProjection, worldToClip) &&
+            DecomposeVRReflection(worldToClip, reflection) &&
+            std::abs(reflection.lensX - g_vrMainLensX) <= 0.03f * g_vrMainLensX &&
+            std::abs(reflection.lensY - g_vrMainLensY) <= 0.03f * g_vrMainLensY)
+        {
+            if (!g_vrViewsLatched)
+                LatchVRViews();
+
+            if (leftEye)
+            {
+                if (g_vrViews.valid)
+                    CountVRReflection(reflection);
+                else
+                    ++g_vrStatistics.noViews;
+            }
+
+            return g_vrViews.valid ? VRDrawKind::Reflection : VRDrawKind::None;
+        }
+
+        if (leftEye)
+        {
+            ++g_vrStatistics.notPerspective;
+            g_vrStatistics.lastNotPerspectiveWidth = surface != nullptr ? surface->width : 0;
+            g_vrStatistics.lastNotPerspectiveHeight = surface != nullptr ? surface->height : 0;
+            g_vrStatistics.lastNotPerspective23 = projection23;
+            g_vrStatistics.lastNotPerspective33 = projection33;
+        }
+
+        return VRDrawKind::None;
     }
 
-    GuestSurface* surface = renderTarget != nullptr ? renderTarget : depthStencil;
     if (surface == nullptr)
     {
         if (leftEye)
             ++g_vrStatistics.noTarget;
 
-        return false;
+        return VRDrawKind::None;
     }
 
     int32_t sceneWidth, sceneHeight;
@@ -1317,16 +1973,53 @@ static bool IsVRCameraDraw(GuestSurface* renderTarget, GuestSurface* depthStenci
         }
     }
 
-    if (!sceneSized)
+    float lensX = std::abs(LoadGuestConstant(g_vertexShaderConstants, projection + 0));
+    float lensY = std::abs(LoadGuestConstant(g_vertexShaderConstants, projection + 5));
+
+    if (sceneSized)
     {
-        if (leftEye)
+        // The world comes first; later scene-sized draws may use cameras of their own (3D HUD items).
+        if (leftEye && !g_vrMainLensSeenThisFrame)
         {
-            ++g_vrStatistics.otherSize;
-            g_vrStatistics.lastOtherWidth = surface->width;
-            g_vrStatistics.lastOtherHeight = surface->height;
+            g_vrMainLensX = lensX;
+            g_vrMainLensY = lensY;
+            g_vrMainLensValid = true;
+            g_vrMainLensSeenThisFrame = true;
+
+            if (!g_vrStatistics.mainSampleTaken)
+            {
+                g_vrStatistics.mainSampleTaken = true;
+
+                for (size_t i = 0; i < 16; i++)
+                {
+                    g_vrStatistics.mainSampleProjection[i] = LoadGuestConstant(g_vertexShaderConstants, projection + i);
+                    g_vrStatistics.mainSampleView[i] = LoadGuestConstant(g_vertexShaderConstants, size_t(vertexShader->vrViewRegister) * 4 + i);
+                }
+            }
+        }
+    }
+    else
+    {
+        bool sameLens = g_vrMainLensValid &&
+            std::abs(lensX - g_vrMainLensX) <= 0.01f * g_vrMainLensX &&
+            std::abs(lensY - g_vrMainLensY) <= 0.01f * g_vrMainLensY;
+
+        if (!sameLens)
+        {
+            if (leftEye)
+            {
+                ++g_vrStatistics.otherSize;
+                g_vrStatistics.lastOtherWidth = surface->width;
+                g_vrStatistics.lastOtherHeight = surface->height;
+                g_vrStatistics.lastOtherProjectionX = lensX;
+                g_vrStatistics.lastOtherProjectionY = lensY;
+            }
+
+            return VRDrawKind::None;
         }
 
-        return false;
+        if (leftEye)
+            ++g_vrStatistics.acceptedSameLens;
     }
 
     if (!g_vrViewsLatched)
@@ -1335,7 +2028,7 @@ static bool IsVRCameraDraw(GuestSurface* renderTarget, GuestSurface* depthStenci
     if (leftEye)
         ++(g_vrViews.valid ? g_vrStatistics.accepted : g_vrStatistics.noViews);
 
-    return g_vrViews.valid;
+    return g_vrViews.valid ? VRDrawKind::Camera : VRDrawKind::None;
 }
 
 static void LogVRStatistics()
@@ -1352,9 +2045,57 @@ static void LogVRStatistics()
     int32_t sceneWidth, sceneHeight;
     GetVRSceneSize(sceneWidth, sceneHeight);
 
-    LOGFN("[VR] Last 5 s: {} immersive / {} flat frames. Camera-shader draws {}: accepted {}, not perspective {}, other target size {} (last {}x{}, scene {}x{}), no target {}, no views {}.",
-        s.immersiveFrames, s.flatFrames, s.cameraShaderDraws, s.accepted, s.notPerspective, s.otherSize,
-        s.lastOtherWidth, s.lastOtherHeight, sceneWidth, sceneHeight, s.noTarget, s.noViews);
+    LOGFN("[VR] Last 5 s: {} immersive / {} flat frames. Camera-shader draws {}: accepted {} ({} same lens), "
+        "not perspective {} (last {}x{}, [2][3] {:.3f}, [3][3] {:.3f}), "
+        "other target {} (last {}x{} lens {:.3f}/{:.3f}; scene {}x{} lens {:.3f}/{:.3f}), no target {}, no views {}.",
+        s.immersiveFrames, s.flatFrames, s.cameraShaderDraws, s.accepted, s.acceptedSameLens,
+        s.notPerspective, s.lastNotPerspectiveWidth, s.lastNotPerspectiveHeight, s.lastNotPerspective23, s.lastNotPerspective33,
+        s.otherSize, s.lastOtherWidth, s.lastOtherHeight, s.lastOtherProjectionX, s.lastOtherProjectionY,
+        sceneWidth, sceneHeight, g_vrMainLensX, g_vrMainLensY, s.noTarget, s.noViews);
+
+    LOGFN("[VR] Last 5 s, 2D draws into the back buffer: on the panel {}, full screen {}, left in place {} (last: shader {:016X}, stride {}, position type {:X}, {}). "
+        "Boost passes neutralised {}. Bloom feedback replaced {} (persistence {:.3f}, history from its own target {}). "
+        "Light shaft passes {} ({} with the light behind the eye; last at {:.3f}, {:.3f}, for the left eye {:.3f}, {:.3f}).",
+        s.twoDOnPanel, s.twoDFullScreen, s.twoDUnhandled, s.lastUnhandledShader, s.lastUnhandledStride,
+        s.lastUnhandledPositionType, s.lastUnhandledReason != nullptr ? s.lastUnhandledReason : "-", s.boostPassesNeutralised,
+        s.bloomFeedbackReplaced, s.lastBloomPersistence, s.bloomHistoryFromOwnTarget,
+        s.lightShaftPasses, s.lightShaftsBehind, s.lastLightShaftGame[0], s.lastLightShaftGame[1],
+        s.lastLightShaftEye[0], s.lastLightShaftEye[1]);
+
+    if (s.reflectionMapReads != 0 || s.reflectionMapDraws != 0 || s.reflectionPerEye != 0)
+    {
+        LOGFN("[VR] Last 5 s, reflections: per eye {} ({} flipped, {} with a clip plane). Reflection map read by {} draws "
+            "({} not resolved, {} from their own target), {}x{}; draws into it {} ({} without camera constants, {} not a mirrored camera).",
+            s.reflectionPerEye, s.reflectionFlipped, s.reflectionOblique, s.reflectionMapReads,
+            s.reflectionMapUnresolved, s.reflectionMapSelf, s.reflectionMapWidth, s.reflectionMapHeight,
+            s.reflectionMapDraws, s.reflectionMapNoCamera, s.reflectionMapNotMirrored);
+    }
+
+    if (s.reflectionSampleTaken)
+    {
+        auto formatMatrix = [](const float* m)
+            {
+                std::string text;
+                for (size_t i = 0; i < 16; i++)
+                {
+                    if (i != 0)
+                        text += (i % 4 == 0) ? " | " : " ";
+
+                    text += fmt::format("{:.4f}", m[i]);
+                }
+
+                return text;
+            };
+
+        const VRReflection& r = s.reflectionSample;
+
+        LOGFN("[VR] Reflection map draw: shader {:016X}, decomposed {} (lens {:.3f}/{:.3f}, offset {:.3f}/{:.3f}, flipped {}, clip plane {}, depth {:.4f}/{:.4f}). "
+            "Projection [{}]. View [{}]. Main camera: projection [{}], view [{}].",
+            s.reflectionSampleShader, s.reflectionSampleDecomposed, r.lensX, r.lensY, r.offsetX, r.offsetY, r.flipped, r.oblique,
+            r.depthScale, r.depthOffset, formatMatrix(s.reflectionSampleProjection), formatMatrix(s.reflectionSampleView),
+            s.mainSampleTaken ? formatMatrix(s.mainSampleProjection) : std::string("-"),
+            s.mainSampleTaken ? formatMatrix(s.mainSampleView) : std::string("-"));
+    }
 
     g_vrStatistics = {};
 }
@@ -1362,6 +2103,9 @@ static void LogVRStatistics()
 // The camera as the eye of the current pass sees it.
 struct VRCameraPatch
 {
+    // The eye's frustum terms for elements [0], [5], [8] and [9], mirrored like the
+    // game's projection when that flips an axis (a reflection camera may).
+    float projectionTerms[4];
     XrMatrix projection;
     XrMatrix view;
     XrMatrix eyeView;
@@ -1376,10 +2120,18 @@ static bool ComputeVRCameraPatch(VRCameraPatch& patch)
     const VREyeState& eye = g_vrEyes[g_vrPass];
 
     patch.projection = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrProjectionRegister);
-    patch.projection.m[0] = eye.projectionTerms[0];
-    patch.projection.m[5] = eye.projectionTerms[1];
-    patch.projection.m[8] = eye.projectionTerms[2];
-    patch.projection.m[9] = eye.projectionTerms[3];
+
+    float signX = patch.projection.m[0] < 0.0f ? -1.0f : 1.0f;
+    float signY = patch.projection.m[5] < 0.0f ? -1.0f : 1.0f;
+    patch.projectionTerms[0] = signX * eye.projectionTerms[0];
+    patch.projectionTerms[1] = signY * eye.projectionTerms[1];
+    patch.projectionTerms[2] = signX * eye.projectionTerms[2];
+    patch.projectionTerms[3] = signY * eye.projectionTerms[3];
+
+    patch.projection.m[0] = patch.projectionTerms[0];
+    patch.projection.m[5] = patch.projectionTerms[1];
+    patch.projection.m[8] = patch.projectionTerms[2];
+    patch.projection.m[9] = patch.projectionTerms[3];
 
     patch.view = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrViewRegister);
     patch.eyeView = XrMatrixMultiply(patch.view, eye.eyeFromView);
@@ -1425,15 +2177,14 @@ static void WriteVREyeDirection(float* constants, const uint32_t* guestConstants
 static void PatchVRVertexShaderConstants(float* constants, const VRCameraPatch& patch)
 {
     GuestShader* shader = g_pipelineState.vertexShader;
-    const VREyeState& eye = g_vrEyes[g_vrPass];
 
     // Only the frustum terms change; the depth terms stay the game's, so its
     // near/far planes and the reverse Z the shaders apply on top still hold.
     float* projection = constants + shader->vrProjectionRegister * 4;
-    projection[0] = eye.projectionTerms[0];
-    projection[5] = eye.projectionTerms[1];
-    projection[8] = eye.projectionTerms[2];
-    projection[9] = eye.projectionTerms[3];
+    projection[0] = patch.projectionTerms[0];
+    projection[5] = patch.projectionTerms[1];
+    projection[8] = patch.projectionTerms[2];
+    projection[9] = patch.projectionTerms[3];
 
     memcpy(constants + shader->vrViewRegister * 4, patch.eyeView.m, shader->vrViewRegisterCount * 4 * sizeof(float));
 
@@ -1473,6 +2224,221 @@ static void PatchVRPixelShaderConstants(float* constants, const VRCameraPatch& p
         XrMatrix inverseProjection;
         if (std::abs(gameProjectionX * gameInverseProjectionX - 1.0f) < 0.01f && XrMatrixInvert(patch.projection, inverseProjection))
             memcpy(constants + shader->vrInverseProjectionRegister * 4, inverseProjection.m, sizeof(inverseProjection.m));
+    }
+}
+
+// Rewrites the uploaded projection of a reflection draw (see VRReflection) for
+// the eye. The eye sits in the mirrored main view where it sits in the main
+// view, so world to clip becomes R * eye * P(eye), with the game's image flip
+// after it, and either the lens's depth terms or, with a clip plane at the water,
+// the game's own depth column. The view register stays the game's (the shader's
+// lighting reads it), so the projection written is view^-1 * world to clip.
+static void PatchVRReflectionProjection(float* constants)
+{
+    GuestShader* shader = g_pipelineState.vertexShader;
+
+    XrMatrix view, gameProjection, gameWorldToClip, inverseView;
+    VRReflection reflection;
+    if (!GetVRWorldToClip(shader, view, gameProjection, gameWorldToClip) ||
+        !DecomposeVRReflection(gameWorldToClip, reflection) ||
+        !XrMatrixInvert(view, inverseView))
+    {
+        return;
+    }
+
+    const VREyeState& eye = g_vrEyes[g_vrPass];
+
+    XrMatrix eyeProjection{};
+    eyeProjection.m[0] = eye.projectionTerms[0];
+    eyeProjection.m[5] = eye.projectionTerms[1];
+    eyeProjection.m[8] = eye.projectionTerms[2];
+    eyeProjection.m[9] = eye.projectionTerms[3];
+    eyeProjection.m[10] = reflection.depthScale;
+    eyeProjection.m[11] = -1.0f;
+    eyeProjection.m[14] = reflection.depthOffset;
+
+    XrMatrix worldToClip = XrMatrixMultiply(XrMatrixMultiply(reflection.mirroredView, eye.eyeFromView), eyeProjection);
+
+    for (size_t row = 0; row < 4; row++)
+    {
+        if (reflection.flipped)
+            worldToClip.m[row * 4 + 1] = -worldToClip.m[row * 4 + 1];
+
+        if (reflection.oblique)
+            worldToClip.m[row * 4 + 2] = reflection.depthColumn[row];
+    }
+
+    XrMatrix projection = XrMatrixMultiply(inverseView, worldToClip);
+    memcpy(constants + shader->vrProjectionRegister * 4, projection.m, sizeof(projection.m));
+}
+
+// The boost passes' pixel shaders (see CreateShader): full-screen distortions
+// centred on a point the game projects with its own camera, which neither
+// matches the eyes nor sits well in a headset. Unless [VR] VRBoostFilter asks
+// for them, their parameters (c150-c152: g_Param, g_Param2, g_Param3) are set
+// so that each pass outputs its source unchanged: no displacement, no blur, and
+// the brightness ring's angle at +90 degrees, where its cosine is zero.
+enum VRBoostShader : uint8_t
+{
+    VR_BOOST_SHADER_NONE,
+    VR_BOOST_SHADER_FX_BOOST_BLUR,
+    VR_BOOST_SHADER_BOOST_BLUR,
+    VR_BOOST_SHADER_BOOST_BLUR_2D
+};
+
+static bool ShouldNeutraliseVRBoostPass()
+{
+    GuestShader* shader = g_pipelineState.pixelShader;
+    return g_vrPass >= 0 && shader != nullptr && shader->vrBoostShader != VR_BOOST_SHADER_NONE && !Config::VRBoostFilter;
+}
+
+static void NeutraliseVRBoostPass(float* constants)
+{
+    float* param = constants + 150 * 4;
+    float* param2 = constants + 151 * 4;
+    float* param3 = constants + 152 * 4;
+
+    switch (g_pipelineState.pixelShader->vrBoostShader)
+    {
+    case VR_BOOST_SHADER_FX_BOOST_BLUR:
+        // Ring angle: (distance - g_Param2.w) / g_Param3.x, clamped to 1. Displacement: g_Param3.y.
+        param2[3] = -1.0e4f;
+        param3[0] = 1.0f;
+        param3[1] = 0.0f;
+        break;
+
+    case VR_BOOST_SHADER_BOOST_BLUR:
+        // Blur step g_Param.x, blend g_Param.z, ring as above, displacement g_Param3.y.
+        param[0] = 0.0f;
+        param[2] = 0.0f;
+        param2[3] = -1.0e4f;
+        param3[0] = 1.0f;
+        param3[1] = 0.0f;
+        break;
+
+    case VR_BOOST_SHADER_BOOST_BLUR_2D:
+        // Blend g_Param.y. Ring: (distance - g_Param3.x) / (distance * g_Param3.y). Displacement: g_Param3.z.
+        param[1] = 0.0f;
+        param3[0] = -1.0e4f;
+        param3[1] = 1.0f;
+        param3[2] = 0.0f;
+        break;
+    }
+
+    if (g_vrPass == 0)
+        ++g_vrStatistics.boostPassesNeutralised;
+}
+
+// The persistent bloom pass (Bloom_BrightPassPersistent) outputs this frame's
+// bright pass (sampDif0) plus its own previous output (sampDif1) times
+// g_BloomStar_Param1.z (c150.z). In VR the previous output is the other eye's,
+// so each eye would carry a ghost of the other eye's glow, one that also trails
+// behind head turns. Unless [VR] VRBloomPersistence asks for it, sampDif1 reads
+// this frame's bright pass instead, weighted by k / (1 - k): the glow a steady
+// scene builds up over frames, without the history. The weight is capped (k at
+// 0.75), as the history also smooths the flicker of small bright spots.
+static bool ShouldReplaceVRBloomFeedback()
+{
+    GuestShader* shader = g_pipelineState.pixelShader;
+    return g_vrPass >= 0 && shader != nullptr && shader->vrPersistentBloomShader && !Config::VRBloomPersistence;
+}
+
+static void NoteVRBloomFeedback(GuestSurface* renderTarget)
+{
+    VRDrawStatistics& s = g_vrStatistics;
+    ++s.bloomFeedbackReplaced;
+    s.lastBloomPersistence = LoadGuestConstant(g_pixelShaderConstants, 150 * 4 + 2);
+
+    GuestTexture* history = g_textures[1];
+    if (history != nullptr && history->vrResolvedFrom == renderTarget)
+        ++s.bloomHistoryFromOwnTarget;
+}
+
+static void ReplaceVRBloomFeedbackWeight(float* constants)
+{
+    float& weight = constants[150 * 4 + 2];
+    float persistence = std::clamp(weight, 0.0f, 0.75f);
+    weight = persistence / (1.0f - persistence);
+}
+
+static void ReplaceVRBloomFeedbackTexture(SharedConstants* constants)
+{
+    constants->texture2DIndices[1] = constants->texture2DIndices[0];
+    constants->texture3DIndices[1] = constants->texture3DIndices[0];
+    constants->textureCubeIndices[1] = constants->textureCubeIndices[0];
+    constants->samplerIndices[1] = constants->samplerIndices[0];
+}
+
+// The light shaft pass (LightShaftFilter) blurs the sky towards the sun's (or
+// the moon's) position on screen, g_LightShaftSunParam[0].xy (c166), in texture
+// coordinates the game projects with its own camera. For the eye, that position
+// is turned back into a direction in the game camera's view (through the main
+// lens), turned with the eye and projected with the eye's lens. With the light
+// behind the eye the shafts are turned off: g_LightShaftSunParam[1].x (c167)
+// weighs the samples.
+static bool ShouldPatchVRLightShafts()
+{
+    GuestShader* shader = g_pipelineState.pixelShader;
+    if (g_vrPass < 0 || shader == nullptr || !shader->vrLightShaftShader || !g_vrMainLensValid)
+        return false;
+
+    if (!g_vrViewsLatched)
+        LatchVRViews();
+
+    return g_vrViews.valid;
+}
+
+static void NoteVRLightShafts()
+{
+    VRDrawStatistics& s = g_vrStatistics;
+    ++s.lightShaftPasses;
+    s.lastLightShaftGame[0] = LoadGuestConstant(g_pixelShaderConstants, 166 * 4 + 0);
+    s.lastLightShaftGame[1] = LoadGuestConstant(g_pixelShaderConstants, 166 * 4 + 1);
+}
+
+static void PatchVRLightShafts(float* constants)
+{
+    float* sun = constants + 166 * 4;
+    float* weight = constants + 167 * 4;
+
+    // Texture coordinates to the game camera's view: a direction, so no translation.
+    float gameDirection[3] =
+    {
+        (sun[0] * 2.0f - 1.0f) / g_vrMainLensX,
+        (1.0f - sun[1] * 2.0f) / g_vrMainLensY,
+        -1.0f
+    };
+
+    const VREyeState& eye = g_vrEyes[g_vrPass];
+    float direction[3];
+    for (size_t column = 0; column < 3; column++)
+    {
+        direction[column] =
+            gameDirection[0] * eye.eyeFromView.m[0 * 4 + column] +
+            gameDirection[1] * eye.eyeFromView.m[1 * 4 + column] +
+            gameDirection[2] * eye.eyeFromView.m[2 * 4 + column];
+    }
+
+    float clipW = -direction[2];
+    if (clipW <= 1e-3f * sqrtf(DotVR3(direction, direction)))
+    {
+        weight[0] = 0.0f;
+
+        if (g_vrPass == 0)
+            ++g_vrStatistics.lightShaftsBehind;
+
+        return;
+    }
+
+    float clipX = direction[0] * eye.projectionTerms[0] + direction[2] * eye.projectionTerms[2];
+    float clipY = direction[1] * eye.projectionTerms[1] + direction[2] * eye.projectionTerms[3];
+    sun[0] = 0.5f + 0.5f * clipX / clipW;
+    sun[1] = 0.5f - 0.5f * clipY / clipW;
+
+    if (g_vrPass == 0)
+    {
+        g_vrStatistics.lastLightShaftEye[0] = sun[0];
+        g_vrStatistics.lastLightShaftEye[1] = sun[1];
     }
 }
 
@@ -2090,6 +3056,17 @@ static void BeginCommandList()
             framebufferDesc.colorAttachmentsCount = 1;
             g_vrOutputFramebuffer = g_device->createFramebuffer(framebufferDesc);
 
+            // The UI texture has the back buffer's size and format, so ImGui's pipelines draw into it.
+            if (g_vrUiTextureDescriptorIndex == NULL)
+                g_vrUiTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
+
+            g_vrUiFramebuffer.reset();
+            g_vrUiTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
+            g_textureDescriptorSet->setTexture(g_vrUiTextureDescriptorIndex, g_vrUiTexture.get(), RenderTextureLayout::SHADER_READ);
+
+            colorAttachment = g_vrUiTexture.get();
+            g_vrUiFramebuffer = g_device->createFramebuffer(framebufferDesc);
+
             g_vrOutputTextureWidth = width;
             g_vrOutputTextureHeight = height;
         }
@@ -2593,6 +3570,16 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
         desc.renderTargetCount = 1;
         g_vrMirrorPipeline = g_device->createGraphicsPipeline(desc);
+
+        // The UI texture holds premultiplied colours.
+        auto uiVertexShader = CREATE_SHADER(xr_ui_vs);
+        auto uiPixelShader = CREATE_SHADER(xr_ui_ps);
+
+        desc.vertexShader = uiVertexShader.get();
+        desc.pixelShader = uiPixelShader.get();
+        desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+        desc.renderTargetBlend[0].srcBlend = RenderBlend::ONE;
+        g_vrUiCompositePipeline = g_device->createGraphicsPipeline(desc);
     }
 
     // NOTE: We initially allocate this on host memory to make the installer work, even if the 4 GB memory allocation fails.
@@ -2706,6 +3693,11 @@ static void ProcDestructResource(const RenderCommand& cmd)
 {
     const auto& args = cmd.destructResource;
     g_tempResources[g_frame].push_back(args.resource);
+
+    // VR: the reflection map's surface is only compared by address; forget it
+    // before the address can be reused.
+    if (g_vrReflectionSurfaceSeen != nullptr && args.resource == g_vrReflectionSurfaceSeen)
+        g_vrReflectionSurfaceSeen = nullptr;
 }
 
 static uint32_t ComputeTexturePitch(GuestTexture* texture)
@@ -3199,8 +4191,32 @@ static void DrawImGui()
 
 static void SetFramebuffer(GuestSurface *renderTarget, GuestSurface *depthStencil, bool settingForClear);
 
+// VR: whether an ImGui triangle covers the whole display: all its corners lie
+// on the display's corners (or just outside, for anti-aliasing fringes).
+static bool IsImGuiFullDisplayTriangle(const ImDrawList* drawList, const ImDrawCmd& drawCmd, uint32_t firstIndex, ImVec2 displaySize)
+{
+    constexpr float Tolerance = 1.5f;
+
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        const ImDrawVert& vertex = drawList->VtxBuffer[drawCmd.VtxOffset + drawList->IdxBuffer[drawCmd.IdxOffset + firstIndex + i]];
+        bool onEdgeX = vertex.pos.x <= Tolerance || vertex.pos.x >= displaySize.x - Tolerance;
+        bool onEdgeY = vertex.pos.y <= Tolerance || vertex.pos.y >= displaySize.y - Tolerance;
+        if (!onEdgeX || !onEdgeY)
+            return false;
+    }
+
+    return true;
+}
+
 static void ProcDrawImGui(const RenderCommand& cmd)
 {
+    // VR: in stereo frames the UI goes on the HUD panel. It is drawn once, in the
+    // left eye's pass, into the UI texture that both eyes composite; what covers
+    // the whole display (fades, dimmed backgrounds) is drawn into each eye.
+    bool vrPanel = IsVRFrameImmersive() && g_vrUiTexture != nullptr;
+    bool vrRightEye = vrPanel && g_vrPass == 1;
+
     // Make sure the backbuffer is the current target.
     AddBarrier(g_backBuffer, RenderTextureLayout::COLOR_WRITE);
     FlushBarriers();
@@ -3208,6 +4224,26 @@ static void ProcDrawImGui(const RenderCommand& cmd)
 
     auto& commandList = g_commandLists[g_frame];
     auto pipeline = g_imPipeline.get();
+
+    RenderFramebuffer* backBufferFramebuffer = g_framebuffer;
+    bool panelBound = false;
+
+    if (vrPanel && !vrRightEye)
+    {
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g_vrUiTexture.get(), RenderTextureLayout::COLOR_WRITE));
+        commandList->setFramebuffer(g_vrUiFramebuffer.get());
+        commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
+        commandList->setFramebuffer(backBufferFramebuffer);
+    }
+
+    auto bindTarget = [&](bool panel)
+        {
+            if (panel != panelBound)
+            {
+                commandList->setFramebuffer(panel ? g_vrUiFramebuffer.get() : backBufferFramebuffer);
+                panelBound = panel;
+            }
+        };
 
     commandList->setGraphicsPipelineLayout(g_imPipelineLayout.get());
     commandList->setPipeline(pipeline);
@@ -3338,10 +4374,39 @@ static void ProcDrawImGui(const RenderCommand& cmd)
                     clipRect = drawCmd.ClipRect;
                 }
 
-                commandList->drawIndexedInstanced(drawCmd.ElemCount, 1, drawCmd.IdxOffset, drawCmd.VtxOffset, 0);
+                if (!vrPanel)
+                {
+                    commandList->drawIndexedInstanced(drawCmd.ElemCount, 1, drawCmd.IdxOffset, drawCmd.VtxOffset, 0);
+                    continue;
+                }
+
+                // Split the command into runs of full-display triangles (into the eye)
+                // and the rest (onto the panel, drawn in the left eye's pass only).
+                uint32_t runStart = 0;
+                while (runStart < drawCmd.ElemCount)
+                {
+                    bool fullDisplay = IsImGuiFullDisplayTriangle(drawList, drawCmd, runStart, drawData.DisplaySize);
+                    uint32_t runEnd = runStart + 3;
+
+                    while (runEnd < drawCmd.ElemCount && IsImGuiFullDisplayTriangle(drawList, drawCmd, runEnd, drawData.DisplaySize) == fullDisplay)
+                        runEnd += 3;
+
+                    if (fullDisplay || !vrRightEye)
+                    {
+                        bindTarget(!fullDisplay);
+                        commandList->drawIndexedInstanced(runEnd - runStart, 1, drawCmd.IdxOffset + runStart, drawCmd.VtxOffset, 0);
+
+                        if (!fullDisplay)
+                            g_vrUiUsed = true;
+                    }
+
+                    runStart = runEnd;
+                }
             }
         }
     }
+
+    bindTarget(false);
 }
 
 // We have to check for this to properly handle the following situation:
@@ -3641,6 +4706,39 @@ static void MirrorVROutput()
     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
 }
 
+// VR: puts the UI ImGui drew this frame on the HUD panel of the eye being drawn.
+static void CompositeVRUi()
+{
+    if (!g_vrUiUsed)
+        return;
+
+    auto& commandList = g_commandLists[g_frame];
+
+    AddBarrier(g_backBuffer, RenderTextureLayout::COLOR_WRITE);
+    FlushBarriers();
+    SetFramebuffer(g_backBuffer, nullptr, true);
+
+    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g_vrUiTexture.get(), RenderTextureLayout::SHADER_READ));
+
+    struct
+    {
+        float panelMatrix[16];
+        uint32_t textureDescriptorIndex;
+    } constants;
+
+    memcpy(constants.panelMatrix, g_vrEyes[g_vrPass].hudMatrix.m, sizeof(constants.panelMatrix));
+    constants.textureDescriptorIndex = g_vrUiTextureDescriptorIndex;
+
+    commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    commandList->setPipeline(g_vrUiCompositePipeline.get());
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&constants, sizeof(constants), 0x100), 2);
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_vrOutputTextureWidth), float(g_vrOutputTextureHeight)));
+    commandList->setScissors(RenderRect(0, 0, g_vrOutputTextureWidth, g_vrOutputTextureHeight));
+    commandList->drawInstanced(6, 1, 0, 0);
+}
+
 static void ProcessRenderCommand(const RenderCommand& cmd);
 
 // VR: the end of a frame. A frame that drew through the game camera is shown
@@ -3655,6 +4753,7 @@ static void ExecuteVROutput()
 
     if (immersive)
     {
+        CompositeVRUi();
         OutputVRImage(g_vrImages.eyes[0]);
         MirrorVROutput();
 
@@ -3664,6 +4763,7 @@ static void ExecuteVROutput()
         for (const RenderCommand& recordedCommand : g_vrRecordedCommands)
             ProcessRenderCommand(recordedCommand);
 
+        CompositeVRUi();
         OutputVRImage(g_vrImages.eyes[1]);
 
         g_vrFrameResult.mode = VRFrameMode::Immersive;
@@ -4014,11 +5114,20 @@ static void FlushViewport()
 
     if (g_dirtyStates.scissorRect)
     {
-        auto scissorRect = g_scissorTestEnable ? g_scissorRect : RenderRect(
-            g_viewport.x,
-            g_viewport.y,
-            g_viewport.x + g_viewport.width,
-            g_viewport.y + g_viewport.height);
+        RenderRect scissorRect;
+
+        if (g_scissorTestEnable && g_vrScissorOnPanel)
+        {
+            scissorRect = GetVRPanelScissorRect();
+        }
+        else
+        {
+            scissorRect = g_scissorTestEnable ? g_scissorRect : RenderRect(
+                g_viewport.x,
+                g_viewport.y,
+                g_viewport.x + g_viewport.width,
+                g_viewport.y + g_viewport.height);
+        }
 
         commandList->setScissors(scissorRect);
 
@@ -4050,6 +5159,7 @@ static void ProcStretchRect(const RenderCommand& cmd)
         args.texture->sourceSurface->destinationTextures.erase(args.texture);
 
     args.texture->sourceSurface = surface;
+    args.texture->vrResolvedFrom = surface;
     surface->destinationTextures.emplace(args.texture);
 
     // If the texture is assigned to any slots, set it again. This'll also push the barrier.
@@ -5232,6 +6342,16 @@ static constexpr float COMMON_SLOPE_SCALED_DEPTH_BIAS_VALUE = 1.0f;
 
 static void FlushRenderStateForRenderThread()
 {
+    // VR: only a draw just put on the HUD panel has its scissor moved there.
+    bool vrDrawOnPanel = g_vrNextDrawOnPanel;
+    g_vrNextDrawOnPanel = false;
+
+    if (vrDrawOnPanel != g_vrScissorOnPanel)
+    {
+        g_vrScissorOnPanel = vrDrawOnPanel;
+        g_dirtyStates.scissorRect = true;
+    }
+
     auto renderTarget = g_pipelineState.colorWriteEnable ? g_renderTarget : nullptr;
     auto depthStencil = g_pipelineState.zEnable ? g_depthStencil : nullptr;
 
@@ -5293,25 +6413,53 @@ static void FlushRenderStateForRenderThread()
     if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
         commandList->setDepthBias(g_depthBias, 0.0f, g_slopeScaledDepthBias);
 
-    // VR: draws through the game camera get the current eye's camera. Constants
-    // uploaded for one kind of draw are not reused for another.
+    // VR: draws through the game camera get the current eye's camera, boost
+    // passes lose their effect, the persistent bloom loses its history, and light
+    // shafts head for the light as the eye sees it.
+    // Constants uploaded for one kind of draw are not reused for another.
+    if (g_vrPass == 0)
+        NoteVRReflectionMapRead(renderTarget);
+
+    VRDrawKind vrDrawKind = (g_vrPass >= 0) ? GetVRDrawKind(renderTarget, depthStencil) : VRDrawKind::None;
+    bool vrNeutraliseBoost = ShouldNeutraliseVRBoostPass();
+    bool vrReplaceBloomFeedback = ShouldReplaceVRBloomFeedback();
+    bool vrPatchLightShafts = ShouldPatchVRLightShafts();
+
+    if (vrReplaceBloomFeedback && g_vrPass == 0)
+        NoteVRBloomFeedback(renderTarget);
+
+    if (vrPatchLightShafts && g_vrPass == 0)
+        NoteVRLightShafts();
     GuestShader* vrVertexPatchShader = nullptr;
     GuestShader* vrPixelPatchShader = nullptr;
     VRCameraPatch vrCameraPatch;
 
-    if (g_vrPass >= 0 && IsVRCameraDraw(renderTarget, depthStencil))
+    if (vrDrawKind != VRDrawKind::None)
     {
         if (g_vrPass == 0)
             ++g_vrCameraDrawCount;
 
         vrVertexPatchShader = g_pipelineState.vertexShader;
-        vrPixelPatchShader = g_pipelineState.pixelShader;
+
+        // A reflection keeps the game's view, which the pixel shader constants follow.
+        if (vrDrawKind == VRDrawKind::Camera)
+            vrPixelPatchShader = g_pipelineState.pixelShader;
     }
 
-    if (vrVertexPatchShader != g_vrVertexPatchShader)
+    if (vrNeutraliseBoost || vrReplaceBloomFeedback || vrPatchLightShafts)
+        vrPixelPatchShader = g_pipelineState.pixelShader;
+
+    if (vrReplaceBloomFeedback != g_vrSharedPatch)
+    {
+        g_dirtyStates.sharedConstants = true;
+        g_vrSharedPatch = vrReplaceBloomFeedback;
+    }
+
+    if (vrVertexPatchShader != g_vrVertexPatchShader || vrDrawKind != g_vrVertexPatchKind)
     {
         g_dirtyStates.vertexShaderConstants = true;
         g_vrVertexPatchShader = vrVertexPatchShader;
+        g_vrVertexPatchKind = vrDrawKind;
     }
 
     if (vrPixelPatchShader != g_vrPixelPatchShader)
@@ -5320,7 +6468,7 @@ static void FlushRenderStateForRenderThread()
         g_vrPixelPatchShader = vrPixelPatchShader;
     }
 
-    bool vrPatch = vrVertexPatchShader != nullptr &&
+    bool vrPatch = vrDrawKind == VRDrawKind::Camera &&
         (g_dirtyStates.vertexShaderConstants || g_dirtyStates.pixelShaderConstants) &&
         ComputeVRCameraPatch(vrCameraPatch);
 
@@ -5330,6 +6478,8 @@ static void FlushRenderStateForRenderThread()
 
         if (vrPatch)
             PatchVRVertexShaderConstants(reinterpret_cast<float*>(vertexShaderConstants.memory), vrCameraPatch);
+        else if (vrDrawKind == VRDrawKind::Reflection)
+            PatchVRReflectionProjection(reinterpret_cast<float*>(vertexShaderConstants.memory));
 
         SetRootDescriptor(vertexShaderConstants, 0);
     }
@@ -5341,12 +6491,24 @@ static void FlushRenderStateForRenderThread()
         if (vrPatch && vrPixelPatchShader != nullptr)
             PatchVRPixelShaderConstants(reinterpret_cast<float*>(pixelShaderConstants.memory), vrCameraPatch);
 
+        if (vrNeutraliseBoost)
+            NeutraliseVRBoostPass(reinterpret_cast<float*>(pixelShaderConstants.memory));
+
+        if (vrReplaceBloomFeedback)
+            ReplaceVRBloomFeedbackWeight(reinterpret_cast<float*>(pixelShaderConstants.memory));
+
+        if (vrPatchLightShafts)
+            PatchVRLightShafts(reinterpret_cast<float*>(pixelShaderConstants.memory));
+
         SetRootDescriptor(pixelShaderConstants, 1);
     }
 
     if (g_dirtyStates.sharedConstants)
     {
         auto sharedConstants = g_uploadAllocators[g_frame].allocate<false>(&g_sharedConstants, sizeof(g_sharedConstants), 0x100);
+
+        if (vrReplaceBloomFeedback)
+            ReplaceVRBloomFeedbackTexture(reinterpret_cast<SharedConstants*>(sharedConstants.memory));
         SetRootDescriptor(sharedConstants, 2);
     }
 
@@ -5524,6 +6686,9 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
 
     auto allocation = g_uploadAllocators[g_frame].allocate<true>(reinterpret_cast<const uint32_t*>(args.vertexStreamZeroData), args.vertexStreamZeroSize, 0x4);
 
+    if (IsVRFrameImmersive() && PlaceVR2DPrimitiveOnPanel(args.vertexStreamZeroData, allocation.memory, args.vertexStreamZeroSize, args.vertexStreamZeroStride))
+        g_vrNextDrawOnPanel = true;
+
     auto& vertexBufferView = g_vertexBufferViews[0];
     vertexBufferView.size = args.primitiveCount * args.vertexStreamZeroStride;
     vertexBufferView.buffer = allocation.buffer->at(allocation.offset);
@@ -5542,6 +6707,13 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
     {
         SetDirtyValue(g_dirtyStates.pipelineState, g_pipelineState.pixelShader,
             args.csdFilterState == CsdFilterState::On ? g_csdFilterShader.get() : g_csdShader);
+    }
+
+    // VR: in stereo frames the HUD goes on a panel, except what covers the whole screen.
+    if (g_pipelineState.vertexShader != nullptr && g_pipelineState.vertexShader->vrHudShader)
+    {
+        SetVRHudOnPanel(IsVRFrameImmersive() &&
+            !CoversVRHudCanvas(args.vertexStreamZeroData, args.vertexStreamZeroSize, args.vertexStreamZeroStride));
     }
 
     FlushRenderStateForRenderThread();
@@ -5887,6 +7059,7 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
 
     constexpr uint32_t ConstantInfoSize = 20;
     constexpr uint16_t RegisterSetFloat4 = 2;
+    constexpr uint16_t RegisterSetSampler = 3;
 
     for (uint32_t i = 0; i < constantCount; i++)
     {
@@ -5900,12 +7073,17 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
         uint16_t registerIndex = *reinterpret_cast<const be<uint16_t>*>(entry + 6);
         uint16_t registerCount = *reinterpret_cast<const be<uint16_t>*>(entry + 8);
 
-        if (registerSet != RegisterSetFloat4 || nameOffset >= tableSize)
+        if ((registerSet != RegisterSetFloat4 && registerSet != RegisterSetSampler) || nameOffset >= tableSize)
             continue;
 
         std::string_view name(reinterpret_cast<const char*>(table + nameOffset), strnlen(reinterpret_cast<const char*>(table + nameOffset), tableSize - nameOffset));
 
-        if (name == "g_MtxProjection" && registerCount == 4)
+        if (registerSet == RegisterSetSampler)
+        {
+            if (name == "g_ReflectionMapSampler" && registerIndex < std::size(g_textures))
+                shader->vrReflectionSamplerRegister = int8_t(registerIndex);
+        }
+        else if (name == "g_MtxProjection" && registerCount == 4)
         {
             shader->vrProjectionRegister = registerIndex;
         }
@@ -5950,6 +7128,18 @@ static GuestShader* CreateShader(const be<uint32_t>* function, ResourceType reso
                 shader->shader = CREATE_SHADER(csd_vs);
             else
                 shader->shaderCacheEntry = findResult;
+
+            shader->vrHudShader = (hash == 0xB1086A4947A797DE || hash == 0xB4CAFC034A37C8A8);
+
+            if (hash == 0xD44C189D5067922E) // FxBoostBlur.xpu
+                shader->vrBoostShader = VR_BOOST_SHADER_FX_BOOST_BLUR;
+            else if (hash == 0xD22F805F4280B8BA) // BoostBlur.xpu
+                shader->vrBoostShader = VR_BOOST_SHADER_BOOST_BLUR;
+            else if (hash == 0xC533F8ED014AC592) // BoostBlur2D.xpu
+                shader->vrBoostShader = VR_BOOST_SHADER_BOOST_BLUR_2D;
+
+            shader->vrPersistentBloomShader = (hash == 0x605C1E349CC4CAAB); // Bloom_BrightPassPersistent.xpu
+            shader->vrLightShaftShader = (hash == 0x66578F29004F8FD0); // LightShaftFilter.xpu
 
             if (shader->shaderCacheEntry != nullptr)
                 FindVRCameraConstants(shader, function);

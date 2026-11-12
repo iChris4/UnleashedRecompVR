@@ -80,6 +80,10 @@ CONFIG_DEFINE("VR", float, VRRenderScale, 1.0f);
 CONFIG_DEFINE("VR", float, VRWorldScale, 1.0f);
 CONFIG_DEFINE("VR", float, VRScreenDistance, 2.5f);
 CONFIG_DEFINE("VR", float, VRScreenWidth, 3.0f);
+CONFIG_DEFINE("VR", float, VRHudDistance, 1.5f);
+CONFIG_DEFINE("VR", float, VRHudWidth, 1.4f);
+CONFIG_DEFINE("VR", bool, VRBoostFilter, false);
+CONFIG_DEFINE("VR", bool, VRBloomPersistence, false);
 
 CONFIG_DEFINE_HIDDEN("Codes", bool, AllowCancellingUnleash, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, DisableAutoSaveWarning, false);

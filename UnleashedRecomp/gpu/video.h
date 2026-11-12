@@ -160,6 +160,10 @@ struct GuestTexture : GuestBaseTexture
     std::unique_ptr<GuestTexture> patchedTexture;
     std::unique_ptr<GuestTexture> recreatedCubeMapTexture;
     struct GuestSurface* sourceSurface = nullptr;
+
+    // VR: the surface last resolved into this texture. Unlike sourceSurface it is
+    // kept once the copy is done; it is only compared, never dereferenced.
+    struct GuestSurface* vrResolvedFrom = nullptr;
 };
 
 struct GuestLockedRect
@@ -298,6 +302,21 @@ struct GuestShader : GuestResource
     uint16_t vrViewRegisterCount = 0;
     int16_t vrEyePositionRegister = -1;
     int16_t vrEyeDirectionRegister = -1;
+
+    // VR: one of the host CSD vertex shaders, which can put the HUD on a panel.
+    bool vrHudShader = false;
+
+    // VR: one of the boost blur pixel shaders (VRBoostShader in video.cpp), or 0.
+    uint8_t vrBoostShader = 0;
+
+    // VR: the persistent bloom pass, which adds the previous frame's bloom.
+    bool vrPersistentBloomShader = false;
+
+    // VR: the light shaft pass, which blurs towards the sun's position on screen.
+    bool vrLightShaftShader = false;
+
+    // VR: the sampler register of the planar reflection map (g_ReflectionMapSampler), or -1.
+    int8_t vrReflectionSamplerRegister = -1;
 #ifdef UNLEASHED_RECOMP_D3D12
     std::vector<ComPtr<IDxcBlob>> shaderBlobs;
     ComPtr<IDxcBlobEncoding> libraryBlob;

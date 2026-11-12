@@ -16,9 +16,13 @@ cbuffer VertexShaderConstants : register(b0, space4)
 cbuffer SharedConstants : register(b2, space4)
 {
 	DEFINE_SHARED_CONSTANTS();
+    float4 g_VRHudMatrix[4] : packoffset(c18);
+    uint g_VRHudEnabled : packoffset(c22.x);
 };
 
 #endif
+
+#include "xr_hud_common.hlsli"
 
 void main(
 	[[vk::location(0)]] in float4 iPosition0 : POSITION0,
@@ -43,9 +47,7 @@ void main(
 	out float4 oColor0 : COLOR0,
 	out float4 oColor1 : COLOR1)
 {
-    oPos.xy = iPosition0.xy * g_ViewportSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
-    oPos.z = g_Z.x;
-    oPos.w = 1.0;
+    oPos = ApplyVRHud(iPosition0.xy * g_ViewportSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0), g_Z.x);
     oTexCoord0 = iColor0.wxyz;
     oTexCoord1 = 0.0;
     oTexCoord2 = 0.0;

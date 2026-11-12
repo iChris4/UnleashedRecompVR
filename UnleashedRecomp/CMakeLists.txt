@@ -501,6 +501,8 @@ compile_pixel_shader(resolve_msaa_depth_2x)
 compile_pixel_shader(resolve_msaa_depth_4x)
 compile_pixel_shader(resolve_msaa_depth_8x)
 compile_pixel_shader(xr_blit_ps)
+compile_pixel_shader(xr_ui_ps)
+compile_vertex_shader(xr_ui_vs)
 
 set(RESOURCES_SOURCE_PATH "${PROJECT_SOURCE_DIR}/../UnleashedRecompResources")
 set(RESOURCES_OUTPUT_PATH "${PROJECT_SOURCE_DIR}/res")

@@ -3,6 +3,7 @@
 #include <user/achievement_manager.h>
 #include <user/persistent_storage_manager.h>
 #include <user/config.h>
+#include <xr/xr.h>
 
 void AchievementManagerUnlockMidAsmHook(PPCRegister& id)
 {
@@ -166,7 +167,10 @@ PPC_FUNC(sub_824C1E60)
 PPC_FUNC_IMPL(__imp__sub_82B4DB48);
 PPC_FUNC(sub_82B4DB48)
 {
-    if (Config::DisableBoostFilter && strcmp((const char*)(base + ctx.r4.u32), "boost") == 0)
+    // In VR the filter covers the whole view; it is off unless [VR] VRBoostFilter asks for it.
+    bool disableBoostFilter = Config::DisableBoostFilter || (VR::IsActive() && !Config::VRBoostFilter);
+
+    if (disableBoostFilter && strcmp((const char*)(base + ctx.r4.u32), "boost") == 0)
     {
         ctx.f1.f64 = 0.0;
     }
