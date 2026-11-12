@@ -34,6 +34,8 @@
 #include <os/logger.h>
 #include <os/process.h>
 #include <xr/xr.h>
+#include <xr/xr_math.h>
+#include <bit>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
 #include <magic_enum/magic_enum.hpp>
@@ -338,19 +340,24 @@ static uint32_t g_intermediaryBackBufferTextureDescriptorIndex;
 
 static std::unique_ptr<RenderPipeline> g_gammaCorrectionPipeline;
 
-// VR: the gamma-corrected screen picture, in the format the OpenXR swapchain can
-// be copied from. Copied into the headset's image and scaled into the window.
-static std::unique_ptr<RenderTexture> g_vrScreenTexture;
-static std::unique_ptr<RenderFramebuffer> g_vrScreenFramebuffer;
-static uint32_t g_vrScreenTextureWidth;
-static uint32_t g_vrScreenTextureHeight;
-static uint32_t g_vrScreenTextureDescriptorIndex;
+// VR: a gamma-corrected picture (the screen, or one eye), in the format the
+// OpenXR swapchains can be copied from. Copied into the headset's image and
+// scaled into the window.
+static std::unique_ptr<RenderTexture> g_vrOutputTexture;
+static std::unique_ptr<RenderFramebuffer> g_vrOutputFramebuffer;
+static uint32_t g_vrOutputTextureWidth;
+static uint32_t g_vrOutputTextureHeight;
+static uint32_t g_vrOutputTextureDescriptorIndex;
 static std::unique_ptr<RenderPipeline> g_vrGammaCorrectionPipeline;
 static std::unique_ptr<RenderPipeline> g_vrMirrorPipeline;
 
-// The headset image acquired for the frame being presented. Written by the
+// The headset images acquired for the frame being presented. Written by the
 // presenting thread before it enqueues ExecuteCommandList, read by the render thread.
-static RenderTexture* g_vrScreenTarget;
+static VRImages g_vrImages;
+
+// How the render thread drew the frame for the headset. Written by the render
+// thread before it signals g_executedCommandList, read by the presenting thread after.
+static VRFrameResult g_vrFrameResult;
 
 struct std::unique_ptr<RenderDescriptorSet> g_textureDescriptorSet;
 struct std::unique_ptr<RenderDescriptorSet> g_samplerDescriptorSet;
@@ -857,6 +864,9 @@ enum class RenderCommandType
     SetStreamSource,
     SetIndices,
     SetPixelShader,
+
+    // Only in the VR replay: re-issues an upload the left eye's pass made.
+    VRReplayUpload,
 };
 
 struct RenderCommand
@@ -1014,14 +1024,457 @@ struct RenderCommand
             GuestBuffer* buffer;
         } setIndices;
 
-        struct 
+        struct
         {
             GuestShader* shader;
         } setPixelShader;
+
+        struct
+        {
+            uint32_t recordIndex;
+        } vrReplayUpload;
     };
 };
 
 static moodycamel::BlockingConcurrentQueue<RenderCommand> g_renderQueue;
+
+// VR stereo by frame replay. The render thread draws each frame for the left
+// eye as its commands arrive and records them; at ExecuteCommandList it outputs
+// that eye, restores the state it had when the frame began and replays the
+// recording for the right eye. The game's camera constants are rewritten per eye
+// when they are uploaded (FlushRenderStateForRenderThread). Commands with side
+// effects of their own (resource lifetime, pipelines, uploads) are not replayed;
+// uploads are re-issued from the copies the left eye's pass made, since the
+// game's CPU-side data may have changed since.
+
+// -1: not rendering for the headset; 0: the left eye, live; 1: the right eye, replayed.
+static int32_t g_vrPass = -1;
+static bool g_vrRecording;
+static std::vector<RenderCommand> g_vrRecordedCommands;
+
+struct VRUploadRecord
+{
+    // Buffer uploads.
+    GuestBuffer* buffer;
+    RenderBuffer* uploadBuffer;
+
+    // Texture uploads.
+    GuestTexture* texture;
+    UploadAllocation allocation;
+    uint32_t pitch;
+};
+
+static std::vector<VRUploadRecord> g_vrUploadRecords;
+
+// The render-thread state at the start of the frame, restored before the replay.
+struct VRStateSnapshot
+{
+    RenderViewport viewport;
+    PipelineState pipelineState;
+    int32_t depthBias;
+    float slopeScaledDepthBias;
+    uint32_t vertexShaderConstants[0x400];
+    uint32_t pixelShaderConstants[0x380];
+    SharedConstants sharedConstants;
+    GuestTexture* textures[16];
+    RenderSamplerDesc samplerDescs[16];
+    bool scissorTestEnable;
+    RenderRect scissorRect;
+    RenderVertexBufferView vertexBufferViews[16];
+    RenderInputSlot inputSlots[16];
+    RenderIndexBufferView indexBufferView;
+};
+
+static VRStateSnapshot g_vrSnapshot;
+
+// The views both eyes are drawn with this frame, latched at its first camera draw.
+struct VREyeState
+{
+    float projectionTerms[4];
+    XrMatrix eyeFromView;
+};
+
+static bool g_vrViewsLatched;
+static VRViews g_vrViews;
+static VREyeState g_vrEyes[2];
+static uint32_t g_vrCameraDrawCount;
+
+// How the left eye's draws were classified, logged every few seconds.
+struct VRDrawStatistics
+{
+    uint32_t immersiveFrames;
+    uint32_t flatFrames;
+    uint32_t cameraShaderDraws;
+    uint32_t notPerspective;
+    uint32_t otherSize;
+    uint32_t noTarget;
+    uint32_t noViews;
+    uint32_t accepted;
+    uint32_t lastOtherWidth;
+    uint32_t lastOtherHeight;
+};
+
+static VRDrawStatistics g_vrStatistics;
+
+// What the last uploaded constants were rewritten for: the shader of a camera
+// draw, or null. A change forces a new upload.
+static GuestShader* g_vrVertexPatchShader;
+static GuestShader* g_vrPixelPatchShader;
+
+static void RecordVRCommand(const RenderCommand& cmd)
+{
+    switch (cmd.type)
+    {
+    case RenderCommandType::DestructResource:
+    case RenderCommandType::UnlockTextureRect: // Recorded as VRReplayUpload.
+    case RenderCommandType::UnlockBuffer16:    // Recorded as VRReplayUpload.
+    case RenderCommandType::UnlockBuffer32:    // Recorded as VRReplayUpload.
+    case RenderCommandType::ExecuteCommandList:
+    case RenderCommandType::BeginCommandList:
+    case RenderCommandType::AddPipeline:
+    case RenderCommandType::VRReplayUpload:
+        break;
+
+    default:
+        g_vrRecordedCommands.push_back(cmd);
+        break;
+    }
+}
+
+static void RecordVRUpload(const VRUploadRecord& record)
+{
+    if (!g_vrRecording)
+        return;
+
+    RenderCommand cmd;
+    cmd.type = RenderCommandType::VRReplayUpload;
+    cmd.vrReplayUpload.recordIndex = uint32_t(g_vrUploadRecords.size());
+    g_vrUploadRecords.push_back(record);
+    g_vrRecordedCommands.push_back(cmd);
+}
+
+static float LoadGuestConstant(const uint32_t* constants, size_t index)
+{
+    return std::bit_cast<float>(ByteSwap(constants[index]));
+}
+
+static XrMatrix LoadGuestMatrix(const uint32_t* constants, size_t firstRegister)
+{
+    XrMatrix matrix;
+    for (size_t i = 0; i < 16; i++)
+        matrix.m[i] = LoadGuestConstant(constants, firstRegister * 4 + i);
+
+    return matrix;
+}
+
+// Called at the end of BeginCommandList while VR is active.
+static void BeginVRFrame()
+{
+    g_vrPass = 0;
+    g_vrRecording = true;
+    g_vrRecordedCommands.clear();
+    g_vrUploadRecords.clear();
+    g_vrViewsLatched = false;
+    g_vrViews = {};
+    g_vrCameraDrawCount = 0;
+    g_vrVertexPatchShader = nullptr;
+    g_vrPixelPatchShader = nullptr;
+    g_vrFrameResult = {};
+
+    g_vrSnapshot.viewport = g_viewport;
+    g_vrSnapshot.pipelineState = g_pipelineState;
+    g_vrSnapshot.depthBias = g_depthBias;
+    g_vrSnapshot.slopeScaledDepthBias = g_slopeScaledDepthBias;
+    memcpy(g_vrSnapshot.vertexShaderConstants, g_vertexShaderConstants, sizeof(g_vertexShaderConstants));
+    memcpy(g_vrSnapshot.pixelShaderConstants, g_pixelShaderConstants, sizeof(g_pixelShaderConstants));
+    g_vrSnapshot.sharedConstants = g_sharedConstants;
+    memcpy(g_vrSnapshot.textures, g_textures, sizeof(g_textures));
+    std::copy(std::begin(g_samplerDescs), std::end(g_samplerDescs), g_vrSnapshot.samplerDescs);
+    g_vrSnapshot.scissorTestEnable = g_scissorTestEnable;
+    g_vrSnapshot.scissorRect = g_scissorRect;
+    std::copy(std::begin(g_vertexBufferViews), std::end(g_vertexBufferViews), g_vrSnapshot.vertexBufferViews);
+    std::copy(std::begin(g_inputSlots), std::end(g_inputSlots), g_vrSnapshot.inputSlots);
+    g_vrSnapshot.indexBufferView = g_indexBufferView;
+}
+
+// Puts the render-thread state back to where the frame began, for the replay.
+static void RestoreVRFrameStart(GuestSurface* backBuffer)
+{
+    // The back buffer was bound at the start; CreateDevice may have moved it since.
+    g_renderTarget = backBuffer;
+    g_depthStencil = nullptr;
+    g_framebuffer = nullptr;
+
+    g_viewport = g_vrSnapshot.viewport;
+    g_pipelineState = g_vrSnapshot.pipelineState;
+    g_depthBias = g_vrSnapshot.depthBias;
+    g_slopeScaledDepthBias = g_vrSnapshot.slopeScaledDepthBias;
+    memcpy(g_vertexShaderConstants, g_vrSnapshot.vertexShaderConstants, sizeof(g_vertexShaderConstants));
+    memcpy(g_pixelShaderConstants, g_vrSnapshot.pixelShaderConstants, sizeof(g_pixelShaderConstants));
+    g_sharedConstants = g_vrSnapshot.sharedConstants;
+    memcpy(g_textures, g_vrSnapshot.textures, sizeof(g_textures));
+
+    // Sampler descriptor indices are only updated when a descriptor changes, so
+    // the descriptors must match the indices restored with the shared constants.
+    std::copy(std::begin(g_vrSnapshot.samplerDescs), std::end(g_vrSnapshot.samplerDescs), g_samplerDescs);
+
+    g_scissorTestEnable = g_vrSnapshot.scissorTestEnable;
+    g_scissorRect = g_vrSnapshot.scissorRect;
+    std::copy(std::begin(g_vrSnapshot.vertexBufferViews), std::end(g_vrSnapshot.vertexBufferViews), g_vertexBufferViews);
+    std::copy(std::begin(g_vrSnapshot.inputSlots), std::end(g_vrSnapshot.inputSlots), g_inputSlots);
+    g_indexBufferView = g_vrSnapshot.indexBufferView;
+
+    g_dirtyStates = DirtyStates(true);
+    g_vrVertexPatchShader = nullptr;
+    g_vrPixelPatchShader = nullptr;
+
+    // The output pass and ImGui bound their own layouts and descriptors.
+    FlushBarriers();
+
+    auto& commandList = g_commandLists[g_frame];
+    commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+}
+
+static void LatchVRViews()
+{
+    g_vrViewsLatched = true;
+
+    VR::GetViews(g_vrViews);
+    if (!g_vrViews.valid)
+        return;
+
+    float unitsPerMeter = std::clamp(Config::VRWorldScale.Value, 0.001f, 1000.0f);
+
+    for (size_t i = 0; i < 2; i++)
+    {
+        const VRViews::Eye& eye = g_vrViews.eyes[i];
+        XrProjectionFrustumTerms(eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown, g_vrEyes[i].projectionTerms);
+        g_vrEyes[i].eyeFromView = XrMatrixEyeFromView(eye.orientation, eye.position, unitsPerMeter);
+    }
+}
+
+// The scene's internal resolution, as the SetResolution hook gives it to the game.
+static void GetVRSceneSize(int32_t& width, int32_t& height)
+{
+    width = int32_t(round(Video::s_viewportWidth * Config::ResolutionScale));
+    height = int32_t(round(Video::s_viewportHeight * Config::ResolutionScale));
+}
+
+// A draw through the game camera: its vertex shader reads the camera's
+// projection and view, the projection is a perspective one, and it renders into
+// the scene's targets (full, half or quarter resolution, within 3% for any
+// alignment the game applies) rather than a shadow map, a cube map or another
+// target with a camera of its own.
+static bool IsVRCameraDraw(GuestSurface* renderTarget, GuestSurface* depthStencil)
+{
+    GuestShader* vertexShader = g_pipelineState.vertexShader;
+    if (vertexShader == nullptr || vertexShader->vrProjectionRegister < 0 || vertexShader->vrViewRegister < 0)
+        return false;
+
+    bool leftEye = (g_vrPass == 0);
+    if (leftEye)
+        ++g_vrStatistics.cameraShaderDraws;
+
+    size_t projection = size_t(vertexShader->vrProjectionRegister) * 4;
+    float projection23 = LoadGuestConstant(g_vertexShaderConstants, projection + 11);
+    float projection33 = LoadGuestConstant(g_vertexShaderConstants, projection + 15);
+    if (std::abs(projection23 + 1.0f) > 0.001f || std::abs(projection33) > 0.001f)
+    {
+        if (leftEye)
+            ++g_vrStatistics.notPerspective;
+
+        return false;
+    }
+
+    GuestSurface* surface = renderTarget != nullptr ? renderTarget : depthStencil;
+    if (surface == nullptr)
+    {
+        if (leftEye)
+            ++g_vrStatistics.noTarget;
+
+        return false;
+    }
+
+    int32_t sceneWidth, sceneHeight;
+    GetVRSceneSize(sceneWidth, sceneHeight);
+
+    bool sceneSized = false;
+
+    for (int32_t divisor : { 1, 2, 4 })
+    {
+        int32_t width = sceneWidth / divisor;
+        int32_t height = sceneHeight / divisor;
+
+        if (std::abs(int32_t(surface->width) - width) <= std::max(2, width * 3 / 100) &&
+            std::abs(int32_t(surface->height) - height) <= std::max(2, height * 3 / 100))
+        {
+            sceneSized = true;
+            break;
+        }
+    }
+
+    if (!sceneSized)
+    {
+        if (leftEye)
+        {
+            ++g_vrStatistics.otherSize;
+            g_vrStatistics.lastOtherWidth = surface->width;
+            g_vrStatistics.lastOtherHeight = surface->height;
+        }
+
+        return false;
+    }
+
+    if (!g_vrViewsLatched)
+        LatchVRViews();
+
+    if (leftEye)
+        ++(g_vrViews.valid ? g_vrStatistics.accepted : g_vrStatistics.noViews);
+
+    return g_vrViews.valid;
+}
+
+static void LogVRStatistics()
+{
+    static auto s_lastLogTime = std::chrono::steady_clock::now();
+
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastLogTime < std::chrono::seconds(5))
+        return;
+
+    s_lastLogTime = now;
+
+    const VRDrawStatistics& s = g_vrStatistics;
+    int32_t sceneWidth, sceneHeight;
+    GetVRSceneSize(sceneWidth, sceneHeight);
+
+    LOGFN("[VR] Last 5 s: {} immersive / {} flat frames. Camera-shader draws {}: accepted {}, not perspective {}, other target size {} (last {}x{}, scene {}x{}), no target {}, no views {}.",
+        s.immersiveFrames, s.flatFrames, s.cameraShaderDraws, s.accepted, s.notPerspective, s.otherSize,
+        s.lastOtherWidth, s.lastOtherHeight, sceneWidth, sceneHeight, s.noTarget, s.noViews);
+
+    g_vrStatistics = {};
+}
+
+// The camera as the eye of the current pass sees it.
+struct VRCameraPatch
+{
+    XrMatrix projection;
+    XrMatrix view;
+    XrMatrix eyeView;
+    float eyePosition[3];
+    float eyeForward[3];
+    float gameForward[3];
+};
+
+static bool ComputeVRCameraPatch(VRCameraPatch& patch)
+{
+    GuestShader* vertexShader = g_pipelineState.vertexShader;
+    const VREyeState& eye = g_vrEyes[g_vrPass];
+
+    patch.projection = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrProjectionRegister);
+    patch.projection.m[0] = eye.projectionTerms[0];
+    patch.projection.m[5] = eye.projectionTerms[1];
+    patch.projection.m[8] = eye.projectionTerms[2];
+    patch.projection.m[9] = eye.projectionTerms[3];
+
+    patch.view = LoadGuestMatrix(g_vertexShaderConstants, vertexShader->vrViewRegister);
+    patch.eyeView = XrMatrixMultiply(patch.view, eye.eyeFromView);
+
+    XrMatrix inverseView, inverseEyeView;
+    if (!XrMatrixInvert(patch.view, inverseView) || !XrMatrixInvert(patch.eyeView, inverseEyeView))
+        return false;
+
+    // The camera's origin and -Z axis in the world: the inverse's last and third rows.
+    for (size_t i = 0; i < 3; i++)
+    {
+        patch.eyePosition[i] = inverseEyeView.m[12 + i];
+        patch.eyeForward[i] = -inverseEyeView.m[8 + i];
+        patch.gameForward[i] = -inverseView.m[8 + i];
+    }
+
+    return true;
+}
+
+static void WriteVRVector(float* constants, int16_t reg, const float value[3])
+{
+    constants[reg * 4 + 0] = value[0];
+    constants[reg * 4 + 1] = value[1];
+    constants[reg * 4 + 2] = value[2];
+}
+
+// The game's g_EyeDirection may point either way along the view axis; keep its sign.
+static void WriteVREyeDirection(float* constants, const uint32_t* guestConstants, int16_t reg, const VRCameraPatch& patch)
+{
+    float original[3] =
+    {
+        LoadGuestConstant(guestConstants, reg * 4 + 0),
+        LoadGuestConstant(guestConstants, reg * 4 + 1),
+        LoadGuestConstant(guestConstants, reg * 4 + 2)
+    };
+
+    float sign = (original[0] * patch.gameForward[0] + original[1] * patch.gameForward[1] + original[2] * patch.gameForward[2]) < 0.0f ? -1.0f : 1.0f;
+    float direction[3] = { patch.eyeForward[0] * sign, patch.eyeForward[1] * sign, patch.eyeForward[2] * sign };
+    WriteVRVector(constants, reg, direction);
+}
+
+// Rewrites the uploaded (little-endian) vertex shader constants for the eye.
+static void PatchVRVertexShaderConstants(float* constants, const VRCameraPatch& patch)
+{
+    GuestShader* shader = g_pipelineState.vertexShader;
+    const VREyeState& eye = g_vrEyes[g_vrPass];
+
+    // Only the frustum terms change; the depth terms stay the game's, so its
+    // near/far planes and the reverse Z the shaders apply on top still hold.
+    float* projection = constants + shader->vrProjectionRegister * 4;
+    projection[0] = eye.projectionTerms[0];
+    projection[5] = eye.projectionTerms[1];
+    projection[8] = eye.projectionTerms[2];
+    projection[9] = eye.projectionTerms[3];
+
+    memcpy(constants + shader->vrViewRegister * 4, patch.eyeView.m, shader->vrViewRegisterCount * 4 * sizeof(float));
+
+    if (shader->vrEyePositionRegister >= 0)
+        WriteVRVector(constants, shader->vrEyePositionRegister, patch.eyePosition);
+
+    if (shader->vrEyeDirectionRegister >= 0)
+        WriteVREyeDirection(constants, g_vertexShaderConstants, shader->vrEyeDirectionRegister, patch);
+}
+
+// Rewrites the uploaded pixel shader constants for the eye. The view and the
+// inverse projection are only rewritten when the game's values are the ones
+// the vertex shader's camera implies, so other matrices in those registers stay.
+static void PatchVRPixelShaderConstants(float* constants, const VRCameraPatch& patch)
+{
+    GuestShader* shader = g_pipelineState.pixelShader;
+    GuestShader* vertexShader = g_pipelineState.vertexShader;
+
+    if (shader->vrEyePositionRegister >= 0)
+        WriteVRVector(constants, shader->vrEyePositionRegister, patch.eyePosition);
+
+    if (shader->vrEyeDirectionRegister >= 0)
+        WriteVREyeDirection(constants, g_pixelShaderConstants, shader->vrEyeDirectionRegister, patch);
+
+    if (shader->vrViewRegister >= 0)
+    {
+        size_t count = shader->vrViewRegisterCount * 4;
+        if (memcmp(&g_pixelShaderConstants[shader->vrViewRegister * 4], &g_vertexShaderConstants[vertexShader->vrViewRegister * 4], count * sizeof(uint32_t)) == 0)
+            memcpy(constants + shader->vrViewRegister * 4, patch.eyeView.m, count * sizeof(float));
+    }
+
+    if (shader->vrInverseProjectionRegister >= 0)
+    {
+        float gameProjectionX = LoadGuestConstant(g_vertexShaderConstants, vertexShader->vrProjectionRegister * 4);
+        float gameInverseProjectionX = LoadGuestConstant(g_pixelShaderConstants, shader->vrInverseProjectionRegister * 4);
+
+        XrMatrix inverseProjection;
+        if (std::abs(gameProjectionX * gameInverseProjectionX - 1.0f) < 0.01f && XrMatrixInvert(patch.projection, inverseProjection))
+            memcpy(constants + shader->vrInverseProjectionRegister * 4, inverseProjection.m, sizeof(inverseProjection.m));
+    }
+}
 
 template<GuestRenderState TType>
 static void SetRenderState(GuestDevice* device, uint32_t value)
@@ -1620,25 +2073,25 @@ static void BeginCommandList()
             g_backBuffer->texture = g_swapChain->getTexture(g_backBufferIndex);
         }
 
-        if (VR::IsActive() && (g_vrScreenTextureWidth != width || g_vrScreenTextureHeight != height))
+        if (VR::IsActive() && (g_vrOutputTextureWidth != width || g_vrOutputTextureHeight != height))
         {
-            if (g_vrScreenTextureDescriptorIndex == NULL)
-                g_vrScreenTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
+            if (g_vrOutputTextureDescriptorIndex == NULL)
+                g_vrOutputTextureDescriptorIndex = g_textureDescriptorAllocator.allocate();
 
             Video::WaitForGPU(); // Only when the screen resolution changes.
 
-            g_vrScreenFramebuffer.reset();
-            g_vrScreenTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, VR::GetScreenFormat(), RenderTextureFlag::RENDER_TARGET));
-            g_textureDescriptorSet->setTexture(g_vrScreenTextureDescriptorIndex, g_vrScreenTexture.get(), RenderTextureLayout::SHADER_READ);
+            g_vrOutputFramebuffer.reset();
+            g_vrOutputTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, VR::GetImageFormat(), RenderTextureFlag::RENDER_TARGET));
+            g_textureDescriptorSet->setTexture(g_vrOutputTextureDescriptorIndex, g_vrOutputTexture.get(), RenderTextureLayout::SHADER_READ);
 
             RenderFramebufferDesc framebufferDesc;
-            const RenderTexture* colorAttachment = g_vrScreenTexture.get();
+            const RenderTexture* colorAttachment = g_vrOutputTexture.get();
             framebufferDesc.colorAttachments = &colorAttachment;
             framebufferDesc.colorAttachmentsCount = 1;
-            g_vrScreenFramebuffer = g_device->createFramebuffer(framebufferDesc);
+            g_vrOutputFramebuffer = g_device->createFramebuffer(framebufferDesc);
 
-            g_vrScreenTextureWidth = width;
-            g_vrScreenTextureHeight = height;
+            g_vrOutputTextureWidth = width;
+            g_vrOutputTextureHeight = height;
         }
     }
     else
@@ -1672,6 +2125,9 @@ static void BeginCommandList()
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+
+    if (VR::IsActive())
+        BeginVRFrame();
 
     g_readyForCommands = true;
     g_readyForCommands.notify_one();
@@ -2121,9 +2577,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     if (VR::IsActive())
     {
-        if (VR::GetScreenFormat() != BACKBUFFER_FORMAT)
+        if (VR::GetImageFormat() != BACKBUFFER_FORMAT)
         {
-            desc.renderTargetFormat[0] = VR::GetScreenFormat();
+            desc.renderTargetFormat[0] = VR::GetImageFormat();
             g_vrGammaCorrectionPipeline = g_device->createGraphicsPipeline(desc);
         }
 
@@ -2295,6 +2751,8 @@ static void ProcUnlockTextureRect(const RenderCommand& cmd)
     g_commandLists[g_frame]->copyTextureRegion(
         RenderTextureCopyLocation::Subresource(args.texture->texture, 0),
         RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, args.texture->format, args.texture->width, args.texture->height, 1, pitch / RenderFormatSize(args.texture->format), allocation.offset));
+
+    RecordVRUpload({ nullptr, nullptr, args.texture, allocation, pitch });
 }
 
 static void* LockBuffer(GuestBuffer* buffer, uint32_t flags)
@@ -2314,9 +2772,12 @@ static void* LockVertexBuffer(GuestBuffer* buffer, uint32_t, uint32_t, uint32_t 
 
 static std::atomic<uint32_t> g_bufferUploadCount = 0;
 
+// Returns the upload buffer the command list copies from, when it does.
 template<typename T>
-static void UnlockBuffer(GuestBuffer* buffer, bool useCopyQueue)
+static RenderBuffer* UnlockBuffer(GuestBuffer* buffer, bool useCopyQueue)
 {
+    RenderBuffer* commandListUploadBuffer = nullptr;
+
     auto copyBuffer = [&](T* dest)
         {
             auto src = reinterpret_cast<const T*>(buffer->mappedMemory);
@@ -2355,11 +2816,14 @@ static void UnlockBuffer(GuestBuffer* buffer, bool useCopyQueue)
             commandList->copyBufferRegion(buffer->buffer->at(0), uploadBuffer->at(0), buffer->dataSize);
             commandList->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(buffer->buffer.get(), RenderBufferAccess::READ));
 
+            commandListUploadBuffer = uploadBuffer.get();
             g_tempBuffers[g_frame].emplace_back(std::move(uploadBuffer));
         }
     }
 
     g_bufferUploadCount++;
+
+    return commandListUploadBuffer;
 }
 
 template<typename T>
@@ -2383,12 +2847,38 @@ static void UnlockBuffer(GuestBuffer* buffer)
 
 static void ProcUnlockBuffer16(const RenderCommand& cmd)
 {
-    UnlockBuffer<uint16_t>(cmd.unlockBuffer.buffer, false);
+    if (auto uploadBuffer = UnlockBuffer<uint16_t>(cmd.unlockBuffer.buffer, false))
+        RecordVRUpload({ cmd.unlockBuffer.buffer, uploadBuffer, nullptr, {}, 0 });
 }
 
 static void ProcUnlockBuffer32(const RenderCommand& cmd)
 {
-    UnlockBuffer<uint32_t>(cmd.unlockBuffer.buffer, false);
+    if (auto uploadBuffer = UnlockBuffer<uint32_t>(cmd.unlockBuffer.buffer, false))
+        RecordVRUpload({ cmd.unlockBuffer.buffer, uploadBuffer, nullptr, {}, 0 });
+}
+
+static void ProcVRReplayUpload(const RenderCommand& cmd)
+{
+    const VRUploadRecord& record = g_vrUploadRecords[cmd.vrReplayUpload.recordIndex];
+    auto& commandList = g_commandLists[g_frame];
+
+    if (record.buffer != nullptr)
+    {
+        commandList->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(record.buffer->buffer.get(), RenderBufferAccess::WRITE));
+        commandList->copyBufferRegion(record.buffer->buffer->at(0), record.uploadBuffer->at(0), record.buffer->dataSize);
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(record.buffer->buffer.get(), RenderBufferAccess::READ));
+    }
+    else
+    {
+        GuestTexture* texture = record.texture;
+
+        AddBarrier(texture, RenderTextureLayout::COPY_DEST);
+        FlushBarriers();
+
+        commandList->copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(texture->texture, 0),
+            RenderTextureCopyLocation::PlacedFootprint(record.allocation.buffer, texture->format, texture->width, texture->height, 1, record.pitch / RenderFormatSize(texture->format), record.allocation.offset));
+    }
 }
 
 static void UnlockVertexBuffer(GuestBuffer* buffer)
@@ -2902,7 +3392,7 @@ void Video::Present()
         // Frames presented without CApplication::Update (the installer, or the
         // main thread after the loading thread presented) begin their XR frame here.
         VR::BeginFrame();
-        g_vrScreenTarget = VR::AcquireScreenImage();
+        VR::AcquireImages(g_vrImages);
     }
 
     cmd.type = RenderCommandType::ExecuteCommandList;
@@ -2922,8 +3412,8 @@ void Video::Present()
     bool pacedByVR = false;
     if (VR::IsActive())
     {
-        pacedByVR = VR::EndFrame();
-        g_vrScreenTarget = nullptr;
+        pacedByVR = VR::EndFrame(g_vrFrameResult);
+        g_vrImages = {};
     }
 
     if (g_swapChainValid)
@@ -3045,9 +3535,9 @@ static void ComputeGammaCorrection(GammaCorrectionConstants& constants)
     constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
 }
 
-// VR: gamma-correct the game's picture into the screen texture, copy it into
-// the headset's image, and scale it into the window.
-static void ExecuteVRScreenPasses()
+// VR: gamma-corrects the game's picture into the output texture and copies it
+// into a headset image (when there is one).
+static void OutputVRImage(RenderTexture* target)
 {
     auto& commandList = g_commandLists[g_frame];
 
@@ -3056,13 +3546,13 @@ static void ExecuteVRScreenPasses()
     constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
     constants.viewportOffsetX = 0;
     constants.viewportOffsetY = 0;
-    constants.viewportWidth = g_vrScreenTextureWidth;
-    constants.viewportHeight = g_vrScreenTextureHeight;
+    constants.viewportWidth = g_vrOutputTextureWidth;
+    constants.viewportHeight = g_vrOutputTextureHeight;
 
     RenderTextureBarrier gammaBarriers[] =
     {
         RenderTextureBarrier(g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ),
-        RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::COLOR_WRITE)
+        RenderTextureBarrier(g_vrOutputTexture.get(), RenderTextureLayout::COLOR_WRITE)
     };
 
     commandList->barriers(RenderBarrierStage::GRAPHICS, gammaBarriers, std::size(gammaBarriers));
@@ -3071,31 +3561,40 @@ static void ExecuteVRScreenPasses()
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
     SetRootDescriptor(g_uploadAllocators[g_frame].allocate<false>(&constants, sizeof(constants), 0x100), 2);
-    commandList->setFramebuffer(g_vrScreenFramebuffer.get());
-    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_vrScreenTextureWidth), float(g_vrScreenTextureHeight)));
-    commandList->setScissors(RenderRect(0, 0, g_vrScreenTextureWidth, g_vrScreenTextureHeight));
+    commandList->setFramebuffer(g_vrOutputFramebuffer.get());
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(g_vrOutputTextureWidth), float(g_vrOutputTextureHeight)));
+    commandList->setScissors(RenderRect(0, 0, g_vrOutputTextureWidth, g_vrOutputTextureHeight));
     commandList->drawInstanced(6, 1, 0, 0);
 
-    if (g_vrScreenTarget != nullptr)
+    if (target != nullptr)
     {
-        // The swapchain image is the sRGB sibling of the screen texture's format,
+        // The swapchain image is the sRGB sibling of the output texture's format,
         // so the compositor decodes the gamma-encoded bytes as such.
         RenderTextureBarrier copyBarriers[] =
         {
-            RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::COPY_SOURCE),
-            RenderTextureBarrier(g_vrScreenTarget, RenderTextureLayout::COPY_DEST)
+            RenderTextureBarrier(g_vrOutputTexture.get(), RenderTextureLayout::COPY_SOURCE),
+            RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST)
         };
 
         commandList->barriers(RenderBarrierStage::COPY, copyBarriers, std::size(copyBarriers));
-        commandList->copyTexture(g_vrScreenTarget, g_vrScreenTexture.get());
+        commandList->copyTexture(target, g_vrOutputTexture.get());
 
         // OpenXR requires the image back in the render target state on release.
-        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g_vrScreenTarget, RenderTextureLayout::COLOR_WRITE));
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
     }
 
+    // The intermediary was transitioned outside the back buffer's layout tracking.
+    g_backBuffer->layout = RenderTextureLayout::UNKNOWN;
+}
+
+// VR: scales the output texture into the window. Follows OutputVRImage, whose
+// pipeline layout and descriptors it uses.
+static void MirrorVROutput()
+{
     if (!g_swapChainValid)
         return;
 
+    auto& commandList = g_commandLists[g_frame];
     auto swapChainTexture = g_swapChain->getTexture(g_backBufferIndex);
     uint32_t windowWidth = g_swapChain->getWidth();
     uint32_t windowHeight = g_swapChain->getHeight();
@@ -3108,10 +3607,10 @@ static void ExecuteVRScreenPasses()
     } mirrorConstants = {};
 
     // Fit the screen into the window, keeping its aspect ratio.
-    float scale = std::min(float(windowWidth) / float(g_vrScreenTextureWidth), float(windowHeight) / float(g_vrScreenTextureHeight));
-    float mirrorWidth = float(g_vrScreenTextureWidth) * scale;
-    float mirrorHeight = float(g_vrScreenTextureHeight) * scale;
-    mirrorConstants.textureDescriptorIndex = g_vrScreenTextureDescriptorIndex;
+    float scale = std::min(float(windowWidth) / float(g_vrOutputTextureWidth), float(windowHeight) / float(g_vrOutputTextureHeight));
+    float mirrorWidth = float(g_vrOutputTextureWidth) * scale;
+    float mirrorHeight = float(g_vrOutputTextureHeight) * scale;
+    mirrorConstants.textureDescriptorIndex = g_vrOutputTextureDescriptorIndex;
     mirrorConstants.destinationRect[0] = (float(windowWidth) - mirrorWidth) * 0.5f;
     mirrorConstants.destinationRect[1] = (float(windowHeight) - mirrorHeight) * 0.5f;
     mirrorConstants.destinationRect[2] = mirrorWidth;
@@ -3128,7 +3627,7 @@ static void ExecuteVRScreenPasses()
 
     RenderTextureBarrier mirrorBarriers[] =
     {
-        RenderTextureBarrier(g_vrScreenTexture.get(), RenderTextureLayout::SHADER_READ),
+        RenderTextureBarrier(g_vrOutputTexture.get(), RenderTextureLayout::SHADER_READ),
         RenderTextureBarrier(swapChainTexture, RenderTextureLayout::COLOR_WRITE)
     };
 
@@ -3142,11 +3641,56 @@ static void ExecuteVRScreenPasses()
     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
 }
 
+static void ProcessRenderCommand(const RenderCommand& cmd);
+
+// VR: the end of a frame. A frame that drew through the game camera is shown
+// in stereo: the left eye's picture (drawn live) is output, then the frame is
+// replayed for the right eye. Any other frame goes to the floating screen.
+static void ExecuteVROutput()
+{
+    g_vrRecording = false;
+
+    bool immersive = g_vrPass == 0 && g_vrViews.valid && g_vrCameraDrawCount > 0 &&
+        g_vrImages.eyes[0] != nullptr && g_vrImages.eyes[1] != nullptr;
+
+    if (immersive)
+    {
+        OutputVRImage(g_vrImages.eyes[0]);
+        MirrorVROutput();
+
+        RestoreVRFrameStart(g_backBuffer);
+        g_vrPass = 1;
+
+        for (const RenderCommand& recordedCommand : g_vrRecordedCommands)
+            ProcessRenderCommand(recordedCommand);
+
+        OutputVRImage(g_vrImages.eyes[1]);
+
+        g_vrFrameResult.mode = VRFrameMode::Immersive;
+        g_vrFrameResult.views = g_vrViews;
+    }
+    else
+    {
+        OutputVRImage(g_vrImages.screen);
+        MirrorVROutput();
+
+        g_vrFrameResult.mode = g_vrImages.screen != nullptr ? VRFrameMode::Flat : VRFrameMode::None;
+        g_vrFrameResult.views = {};
+    }
+
+    ++(immersive ? g_vrStatistics.immersiveFrames : g_vrStatistics.flatFrames);
+    LogVRStatistics();
+
+    g_vrPass = -1;
+    g_vrRecordedCommands.clear();
+    g_vrUploadRecords.clear();
+}
+
 static void ProcExecuteCommandList(const RenderCommand& cmd)
 {
-    if (VR::IsActive() && g_vrScreenTexture != nullptr && g_backBuffer->texture == g_intermediaryBackBufferTexture.get())
+    if (VR::IsActive() && g_vrOutputTexture != nullptr && g_backBuffer->texture == g_intermediaryBackBufferTexture.get())
     {
-        ExecuteVRScreenPasses();
+        ExecuteVROutput();
     }
     else if (g_swapChainValid)
     {
@@ -3239,9 +3783,9 @@ void Video::ComputeViewportDimensions()
 {
     if (VR::IsActive())
     {
-        // The headset's screen is 16:9 at its own resolution; the window only mirrors it.
-        s_viewportWidth = VR::GetScreenWidth();
-        s_viewportHeight = VR::GetScreenHeight();
+        // The game renders for a screen the shape and resolution of an eye; the window only mirrors the headset.
+        s_viewportWidth = VR::GetRenderWidth();
+        s_viewportHeight = VR::GetRenderHeight();
         AspectRatioPatches::ComputeOffsets();
         return;
     }
@@ -4749,15 +5293,54 @@ static void FlushRenderStateForRenderThread()
     if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
         commandList->setDepthBias(g_depthBias, 0.0f, g_slopeScaledDepthBias);
 
+    // VR: draws through the game camera get the current eye's camera. Constants
+    // uploaded for one kind of draw are not reused for another.
+    GuestShader* vrVertexPatchShader = nullptr;
+    GuestShader* vrPixelPatchShader = nullptr;
+    VRCameraPatch vrCameraPatch;
+
+    if (g_vrPass >= 0 && IsVRCameraDraw(renderTarget, depthStencil))
+    {
+        if (g_vrPass == 0)
+            ++g_vrCameraDrawCount;
+
+        vrVertexPatchShader = g_pipelineState.vertexShader;
+        vrPixelPatchShader = g_pipelineState.pixelShader;
+    }
+
+    if (vrVertexPatchShader != g_vrVertexPatchShader)
+    {
+        g_dirtyStates.vertexShaderConstants = true;
+        g_vrVertexPatchShader = vrVertexPatchShader;
+    }
+
+    if (vrPixelPatchShader != g_vrPixelPatchShader)
+    {
+        g_dirtyStates.pixelShaderConstants = true;
+        g_vrPixelPatchShader = vrPixelPatchShader;
+    }
+
+    bool vrPatch = vrVertexPatchShader != nullptr &&
+        (g_dirtyStates.vertexShaderConstants || g_dirtyStates.pixelShaderConstants) &&
+        ComputeVRCameraPatch(vrCameraPatch);
+
     if (g_dirtyStates.vertexShaderConstants)
     {
         auto vertexShaderConstants = g_uploadAllocators[g_frame].allocate<true>(g_vertexShaderConstants, sizeof(g_vertexShaderConstants), 0x100);
+
+        if (vrPatch)
+            PatchVRVertexShaderConstants(reinterpret_cast<float*>(vertexShaderConstants.memory), vrCameraPatch);
+
         SetRootDescriptor(vertexShaderConstants, 0);
     }
 
     if (g_dirtyStates.pixelShaderConstants)
     {
         auto pixelShaderConstants = g_uploadAllocators[g_frame].allocate<true>(g_pixelShaderConstants, sizeof(g_pixelShaderConstants), 0x100);
+
+        if (vrPatch && vrPixelPatchShader != nullptr)
+            PatchVRPixelShaderConstants(reinterpret_cast<float*>(pixelShaderConstants.memory), vrCameraPatch);
+
         SetRootDescriptor(pixelShaderConstants, 1);
     }
 
@@ -5286,6 +5869,66 @@ static ShaderCacheEntry* FindShaderCacheEntry(XXH64_hash_t hash)
     return findResult != end && findResult->hash == hash ? findResult : nullptr;
 }
 
+// Reads the Xenos shader container's constant table (D3DXSHADER_CONSTANTTABLE)
+// for the registers of the camera constants VR rewrites per eye.
+static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* function)
+{
+    const uint8_t* container = reinterpret_cast<const uint8_t*>(function);
+    uint32_t containerSize = function[1] + function[2];
+    uint32_t constantTableOffset = function[4];
+    if (constantTableOffset == 0 || constantTableOffset + 0x20 > containerSize)
+        return;
+
+    // ConstantTableContainer: a size, then the D3DXSHADER_CONSTANTTABLE its offsets are relative to.
+    const uint8_t* table = container + constantTableOffset + 4;
+    uint32_t tableSize = containerSize - constantTableOffset - 4;
+    uint32_t constantCount = *reinterpret_cast<const be<uint32_t>*>(table + 12);
+    uint32_t constantInfoOffset = *reinterpret_cast<const be<uint32_t>*>(table + 16);
+
+    constexpr uint32_t ConstantInfoSize = 20;
+    constexpr uint16_t RegisterSetFloat4 = 2;
+
+    for (uint32_t i = 0; i < constantCount; i++)
+    {
+        uint32_t entryOffset = constantInfoOffset + i * ConstantInfoSize;
+        if (entryOffset + ConstantInfoSize > tableSize)
+            break;
+
+        const uint8_t* entry = table + entryOffset;
+        uint32_t nameOffset = *reinterpret_cast<const be<uint32_t>*>(entry);
+        uint16_t registerSet = *reinterpret_cast<const be<uint16_t>*>(entry + 4);
+        uint16_t registerIndex = *reinterpret_cast<const be<uint16_t>*>(entry + 6);
+        uint16_t registerCount = *reinterpret_cast<const be<uint16_t>*>(entry + 8);
+
+        if (registerSet != RegisterSetFloat4 || nameOffset >= tableSize)
+            continue;
+
+        std::string_view name(reinterpret_cast<const char*>(table + nameOffset), strnlen(reinterpret_cast<const char*>(table + nameOffset), tableSize - nameOffset));
+
+        if (name == "g_MtxProjection" && registerCount == 4)
+        {
+            shader->vrProjectionRegister = registerIndex;
+        }
+        else if (name == "g_MtxInvProjection" && registerCount == 4)
+        {
+            shader->vrInverseProjectionRegister = registerIndex;
+        }
+        else if (name == "g_MtxView" && (registerCount == 3 || registerCount == 4))
+        {
+            shader->vrViewRegister = registerIndex;
+            shader->vrViewRegisterCount = registerCount;
+        }
+        else if (name == "g_EyePosition")
+        {
+            shader->vrEyePositionRegister = registerIndex;
+        }
+        else if (name == "g_EyeDirection")
+        {
+            shader->vrEyeDirectionRegister = registerIndex;
+        }
+    }
+}
+
 static GuestShader* CreateShader(const be<uint32_t>* function, ResourceType resourceType)
 {
     XXH64_hash_t hash = XXH3_64bits(function, function[1] + function[2]);
@@ -5307,6 +5950,9 @@ static GuestShader* CreateShader(const be<uint32_t>* function, ResourceType reso
                 shader->shader = CREATE_SHADER(csd_vs);
             else
                 shader->shaderCacheEntry = findResult;
+
+            if (shader->shaderCacheEntry != nullptr)
+                FindVRCameraConstants(shader, function);
 
             findResult->guestShader = shader;
         }
@@ -5478,6 +6124,49 @@ static void ProcSetPixelShader(const RenderCommand& cmd)
     SetDirtyValue(g_dirtyStates.pipelineState, g_pipelineState.pixelShader, shader);
 }
 
+static void ProcessRenderCommand(const RenderCommand& cmd)
+{
+    // Recorded before running, so a command that ends the recording (ExecuteCommandList) or
+    // records an upload of its own (the unlocks) keeps the recording in stream order.
+    if (g_vrRecording)
+        RecordVRCommand(cmd);
+
+    switch (cmd.type)
+    {
+    case RenderCommandType::SetRenderState:                    ProcSetRenderState(cmd); break;
+    case RenderCommandType::DestructResource:                  ProcDestructResource(cmd); break;
+    case RenderCommandType::UnlockTextureRect:                 ProcUnlockTextureRect(cmd); break;
+    case RenderCommandType::UnlockBuffer16:                    ProcUnlockBuffer16(cmd); break;
+    case RenderCommandType::UnlockBuffer32:                    ProcUnlockBuffer32(cmd); break;
+    case RenderCommandType::DrawImGui:                         ProcDrawImGui(cmd); break;
+    case RenderCommandType::ExecuteCommandList:                ProcExecuteCommandList(cmd); break;
+    case RenderCommandType::BeginCommandList:                  ProcBeginCommandList(cmd); break;
+    case RenderCommandType::StretchRect:                       ProcStretchRect(cmd); break;
+    case RenderCommandType::SetRenderTarget:                   ProcSetRenderTarget(cmd); break;
+    case RenderCommandType::SetDepthStencilSurface:            ProcSetDepthStencilSurface(cmd); break;
+    case RenderCommandType::ExecutePendingStretchRectCommands: ProcExecutePendingStretchRectCommands(cmd); break;
+    case RenderCommandType::Clear:                             ProcClear(cmd); break;
+    case RenderCommandType::SetViewport:                       ProcSetViewport(cmd); break;
+    case RenderCommandType::SetTexture:                        ProcSetTexture(cmd); break;
+    case RenderCommandType::SetScissorRect:                    ProcSetScissorRect(cmd); break;
+    case RenderCommandType::SetSamplerState:                   ProcSetSamplerState(cmd); break;
+    case RenderCommandType::SetBooleans:                       ProcSetBooleans(cmd); break;
+    case RenderCommandType::SetVertexShaderConstants:          ProcSetVertexShaderConstants(cmd); break;
+    case RenderCommandType::SetPixelShaderConstants:           ProcSetPixelShaderConstants(cmd); break;
+    case RenderCommandType::AddPipeline:                       ProcAddPipeline(cmd); break;
+    case RenderCommandType::DrawPrimitive:                     ProcDrawPrimitive(cmd); break;
+    case RenderCommandType::DrawIndexedPrimitive:              ProcDrawIndexedPrimitive(cmd); break;
+    case RenderCommandType::DrawPrimitiveUP:                   ProcDrawPrimitiveUP(cmd); break;
+    case RenderCommandType::SetVertexDeclaration:              ProcSetVertexDeclaration(cmd); break;
+    case RenderCommandType::SetVertexShader:                   ProcSetVertexShader(cmd); break;
+    case RenderCommandType::SetStreamSource:                   ProcSetStreamSource(cmd); break;
+    case RenderCommandType::SetIndices:                        ProcSetIndices(cmd); break;
+    case RenderCommandType::SetPixelShader:                    ProcSetPixelShader(cmd); break;
+    case RenderCommandType::VRReplayUpload:                    ProcVRReplayUpload(cmd); break;
+    default:                                                   assert(false && "Unrecognized render command type."); break;
+    }
+}
+
 static std::thread g_renderThread([]
     {
 #ifdef _WIN32
@@ -5492,42 +6181,7 @@ static std::thread g_renderThread([]
             size_t count = g_renderQueue.wait_dequeue_bulk(commands, std::size(commands));
 
             for (size_t i = 0; i < count; i++)
-            {
-                auto& cmd = commands[i];
-                switch (cmd.type)
-                {
-                case RenderCommandType::SetRenderState:                    ProcSetRenderState(cmd); break;
-                case RenderCommandType::DestructResource:                  ProcDestructResource(cmd); break;
-                case RenderCommandType::UnlockTextureRect:                 ProcUnlockTextureRect(cmd); break;
-                case RenderCommandType::UnlockBuffer16:                    ProcUnlockBuffer16(cmd); break;
-                case RenderCommandType::UnlockBuffer32:                    ProcUnlockBuffer32(cmd); break;
-                case RenderCommandType::DrawImGui:                         ProcDrawImGui(cmd); break;
-                case RenderCommandType::ExecuteCommandList:                ProcExecuteCommandList(cmd); break;
-                case RenderCommandType::BeginCommandList:                  ProcBeginCommandList(cmd); break;
-                case RenderCommandType::StretchRect:                       ProcStretchRect(cmd); break;
-                case RenderCommandType::SetRenderTarget:                   ProcSetRenderTarget(cmd); break;
-                case RenderCommandType::SetDepthStencilSurface:            ProcSetDepthStencilSurface(cmd); break;
-                case RenderCommandType::ExecutePendingStretchRectCommands: ProcExecutePendingStretchRectCommands(cmd); break;
-                case RenderCommandType::Clear:                             ProcClear(cmd); break;
-                case RenderCommandType::SetViewport:                       ProcSetViewport(cmd); break;
-                case RenderCommandType::SetTexture:                        ProcSetTexture(cmd); break;
-                case RenderCommandType::SetScissorRect:                    ProcSetScissorRect(cmd); break;
-                case RenderCommandType::SetSamplerState:                   ProcSetSamplerState(cmd); break;
-                case RenderCommandType::SetBooleans:                       ProcSetBooleans(cmd); break;
-                case RenderCommandType::SetVertexShaderConstants:          ProcSetVertexShaderConstants(cmd); break;
-                case RenderCommandType::SetPixelShaderConstants:           ProcSetPixelShaderConstants(cmd); break;
-                case RenderCommandType::AddPipeline:                       ProcAddPipeline(cmd); break;
-                case RenderCommandType::DrawPrimitive:                     ProcDrawPrimitive(cmd); break;
-                case RenderCommandType::DrawIndexedPrimitive:              ProcDrawIndexedPrimitive(cmd); break;
-                case RenderCommandType::DrawPrimitiveUP:                   ProcDrawPrimitiveUP(cmd); break;
-                case RenderCommandType::SetVertexDeclaration:              ProcSetVertexDeclaration(cmd); break;
-                case RenderCommandType::SetVertexShader:                   ProcSetVertexShader(cmd); break;
-                case RenderCommandType::SetStreamSource:                   ProcSetStreamSource(cmd); break;
-                case RenderCommandType::SetIndices:                        ProcSetIndices(cmd); break;
-                case RenderCommandType::SetPixelShader:                    ProcSetPixelShader(cmd); break;
-                default:                                                   assert(false && "Unrecognized render command type."); break;
-                }
-            }
+                ProcessRenderCommand(commands[i]);
         }
     });
 

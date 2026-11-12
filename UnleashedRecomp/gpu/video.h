@@ -288,6 +288,16 @@ struct GuestShader : GuestResource
     std::unique_ptr<RenderShader> shader;
     struct ShaderCacheEntry* shaderCacheEntry = nullptr;
     ankerl::unordered_dense::map<uint32_t, std::unique_ptr<RenderShader>> linkedShaders;
+
+    // VR: the float4 registers of the engine's camera constants this shader reads,
+    // from its constant table (-1 when it does not read them). Per-eye values are
+    // written there when the constants are uploaded.
+    int16_t vrProjectionRegister = -1;
+    int16_t vrInverseProjectionRegister = -1;
+    int16_t vrViewRegister = -1;
+    uint16_t vrViewRegisterCount = 0;
+    int16_t vrEyePositionRegister = -1;
+    int16_t vrEyeDirectionRegister = -1;
 #ifdef UNLEASHED_RECOMP_D3D12
     std::vector<ComPtr<IDxcBlob>> shaderBlobs;
     ComPtr<IDxcBlobEncoding> libraryBlob;

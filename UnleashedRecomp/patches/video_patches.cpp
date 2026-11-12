@@ -2,6 +2,7 @@
 #include <api/SWA.h>
 #include <ui/game_window.h>
 #include <gpu/video.h>
+#include <xr/xr.h>
 #include "aspect_ratio_patches.h"
 
 using SVertexData = SWA::Sequence::Utility::CPlayMovieWrapper::CRender::SVertexData;
@@ -66,7 +67,9 @@ void RemoveMoviePlayerLetterboxMidAsmHook() {}
 
 bool MotionBlurMidAsmHook()
 {
-    return Config::MotionBlur != EMotionBlur::Off;
+    // In VR each eye is drawn from its own view, so the previous frame's camera
+    // that motion blur compares against is the wrong one for at least one eye.
+    return Config::MotionBlur != EMotionBlur::Off && !VR::IsActive();
 }
 
 // Hedgehog::MirageDebug::PrepareRenderPrimitive2D

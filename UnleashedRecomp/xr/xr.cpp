@@ -20,21 +20,32 @@ static std::unique_ptr<PortVr::OpenXRRuntime> g_runtime;
 static std::mutex g_mutex;
 
 static int64_t g_swapchainFormat;
-static plume::RenderFormat g_renderFormat = plume::RenderFormat::B8G8R8A8_UNORM;
+static plume::RenderFormat g_imageFormat = plume::RenderFormat::B8G8R8A8_UNORM;
 static bool g_swapchainSrgb;
 
-static uint32_t g_screenWidth = 1920;
-static uint32_t g_screenHeight = 1080;
+static uint32_t g_renderWidth = 1920;
+static uint32_t g_renderHeight = 1080;
 static XrSwapchainState g_screenSwapchain;
+static XrSwapchainState g_eyeSwapchains[2];
 
 static PortVr::OpenXRFrame g_frame;
 static bool g_frameBegun;
 static std::atomic<bool> g_inputFocused;
 
-// The screen is placed once in the application space, in front of the head
-// with the head's heading, and stays there while the player looks around.
+// The head position the game camera stands at, set on the first tracked frame
+// and on every recenter.
+static bool g_baseValid;
+static XrVector3f g_basePosition;
+
+static std::mutex g_viewsMutex;
+static VRViews g_views;
+
+// The flat screen is placed once in the application space, in front of the
+// head with the head's heading, and stays there while the player looks around.
 static bool g_screenPlaced;
 static XrPosef g_screenPose{ { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f } };
+
+static VRFrameMode g_lastFrameMode = VRFrameMode::None;
 
 static void LogOpenXR(PortVr::OpenXRLogLevel level, std::string_view message)
 {
@@ -89,7 +100,7 @@ static bool CreateSwapchain(XrSwapchainState& swapchain, uint32_t width, uint32_
     swapchain.width = width;
     swapchain.height = height;
 
-    result = XrD3D12::EnumerateSwapchainImages(swapchain.handle, width, height, g_renderFormat, swapchain.images);
+    result = XrD3D12::EnumerateSwapchainImages(swapchain.handle, width, height, g_imageFormat, swapchain.images);
     g_runtime->ObserveResult(result);
     if (XR_FAILED(result))
     {
@@ -102,10 +113,10 @@ static bool CreateSwapchain(XrSwapchainState& swapchain, uint32_t width, uint32_
     return true;
 }
 
-static bool AcquireSwapchain(XrSwapchainState& swapchain)
+static plume::RenderTexture* AcquireSwapchain(XrSwapchainState& swapchain)
 {
     if (swapchain.acquired)
-        return true;
+        return swapchain.images[swapchain.acquiredIndex].get();
 
     XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     XrResult result = xrAcquireSwapchainImage(swapchain.handle, &acquireInfo, &swapchain.acquiredIndex);
@@ -113,7 +124,7 @@ static bool AcquireSwapchain(XrSwapchainState& swapchain)
     if (XR_FAILED(result))
     {
         LOGFN_ERROR("[VR] xrAcquireSwapchainImage failed ({}).", int32_t(result));
-        return false;
+        return nullptr;
     }
 
     swapchain.acquired = true;
@@ -127,10 +138,10 @@ static bool AcquireSwapchain(XrSwapchainState& swapchain)
         // OpenXR forbids releasing an image whose wait did not succeed. Leave it
         // acquired; the session teardown destroys it.
         LOGFN_ERROR("[VR] xrWaitSwapchainImage failed ({}).", int32_t(result));
-        return false;
+        return nullptr;
     }
 
-    return true;
+    return swapchain.images[swapchain.acquiredIndex].get();
 }
 
 static bool ReleaseSwapchain(XrSwapchainState& swapchain)
@@ -180,6 +191,52 @@ static void PlaceScreen()
     g_screenPlaced = true;
 }
 
+static void PublishViews()
+{
+    VRViews views;
+
+    if (g_frame.should_render && g_frame.views_valid)
+    {
+        const XrView* xrViews = g_frame.views.data();
+
+        if (!g_baseValid && (g_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0)
+        {
+            g_basePosition.x = 0.5f * (xrViews[0].pose.position.x + xrViews[1].pose.position.x);
+            g_basePosition.y = 0.5f * (xrViews[0].pose.position.y + xrViews[1].pose.position.y);
+            g_basePosition.z = 0.5f * (xrViews[0].pose.position.z + xrViews[1].pose.position.z);
+            g_baseValid = true;
+        }
+
+        if (g_baseValid)
+        {
+            views.valid = true;
+            views.basePosition[0] = g_basePosition.x;
+            views.basePosition[1] = g_basePosition.y;
+            views.basePosition[2] = g_basePosition.z;
+
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                const XrView& xrView = xrViews[i];
+                VRViews::Eye& eye = views.eyes[i];
+                eye.orientation[0] = xrView.pose.orientation.x;
+                eye.orientation[1] = xrView.pose.orientation.y;
+                eye.orientation[2] = xrView.pose.orientation.z;
+                eye.orientation[3] = xrView.pose.orientation.w;
+                eye.position[0] = xrView.pose.position.x - g_basePosition.x;
+                eye.position[1] = xrView.pose.position.y - g_basePosition.y;
+                eye.position[2] = xrView.pose.position.z - g_basePosition.z;
+                eye.angleLeft = xrView.fov.angleLeft;
+                eye.angleRight = xrView.fov.angleRight;
+                eye.angleUp = xrView.fov.angleUp;
+                eye.angleDown = xrView.fov.angleDown;
+            }
+        }
+    }
+
+    std::lock_guard lock(g_viewsMutex);
+    g_views = views;
+}
+
 bool VR::Init()
 {
     if (g_runtime != nullptr)
@@ -191,6 +248,7 @@ bool VR::Init()
     config.reference_space = XR_REFERENCE_SPACE_TYPE_LOCAL;
     config.required_extensions = { XrD3D12::EXTENSION_NAME };
     config.optional_extensions = { "XR_KHR_win32_convert_performance_counter_time" };
+    config.resolution_scale = std::clamp(Config::VRRenderScale.Value, 0.25f, 2.0f);
 
     g_runtime = std::make_unique<PortVr::OpenXRRuntime>(LogOpenXR);
 
@@ -201,9 +259,13 @@ bool VR::Init()
         return false;
     }
 
-    g_screenHeight = std::clamp(Config::VRScreenResolution.Value, 360, 4320);
-    g_screenWidth = (g_screenHeight * 16 + 8) / 9;
-    g_screenWidth = (g_screenWidth + 1) & ~1u;
+    // One resolution for both eyes: they share the game's render targets.
+    const auto& view = g_runtime->ViewConfiguration()[0];
+    g_renderWidth = std::max(64u, view.render_width & ~1u);
+    g_renderHeight = std::max(64u, view.render_height & ~1u);
+
+    LOGFN("[VR] Recommended eye resolution {}x{}; rendering at {}x{}.",
+        view.properties.recommendedImageRectWidth, view.properties.recommendedImageRectHeight, g_renderWidth, g_renderHeight);
 
     return true;
 }
@@ -232,17 +294,20 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
     if (!g_runtime->CreateSession(XrD3D12::GetGraphicsBinding(device, queue)))
         return false;
 
-    if (!XrD3D12::SelectSwapchainFormat(g_runtime->SwapchainFormats(), g_swapchainFormat, g_renderFormat, g_swapchainSrgb))
+    if (!XrD3D12::SelectSwapchainFormat(g_runtime->SwapchainFormats(), g_swapchainFormat, g_imageFormat, g_swapchainSrgb))
         return false;
 
-    if (!CreateSwapchain(g_screenSwapchain, g_screenWidth, g_screenHeight, "screen"))
+    if (!CreateSwapchain(g_screenSwapchain, g_renderWidth, g_renderHeight, "screen") ||
+        !CreateSwapchain(g_eyeSwapchains[0], g_renderWidth, g_renderHeight, "left eye") ||
+        !CreateSwapchain(g_eyeSwapchains[1], g_renderWidth, g_renderHeight, "right eye"))
+    {
         return false;
+    }
 
     if (!XrInput::Create(*g_runtime))
         LOGN_WARNING("[VR] Motion controllers are unavailable; use a gamepad or the keyboard.");
 
-    LOGFN("[VR] Session created on '{}' ({}). Screen {}x{}.",
-        g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name, g_screenWidth, g_screenHeight);
+    LOGFN("[VR] Session created on '{}' ({}).", g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name);
 
     return true;
 }
@@ -262,14 +327,21 @@ void VR::Shutdown()
     if (g_runtime->HasSession())
     {
         XrInput::Destroy();
-        ReleaseSwapchain(g_screenSwapchain);
-        DestroySwapchain(g_screenSwapchain);
+
+        for (XrSwapchainState* swapchain : { &g_screenSwapchain, &g_eyeSwapchains[0], &g_eyeSwapchains[1] })
+        {
+            ReleaseSwapchain(*swapchain);
+            DestroySwapchain(*swapchain);
+        }
     }
 
     g_frameBegun = false;
     g_inputFocused = false;
     g_runtime->Shutdown();
     g_runtime.reset();
+
+    std::lock_guard viewsLock(g_viewsMutex);
+    g_views = {};
 }
 
 void VR::BeginFrame()
@@ -300,12 +372,17 @@ void VR::BeginFrame()
     g_frameBegun = true;
 
     // The runtime recentred (or otherwise moved) the application space: put the
-    // screen back in front of the head once the change is in effect.
+    // game camera and the screen back in front of the head once that is in effect.
     if (g_runtime->ConsumeAppSpaceChangesThrough(g_frame.predicted_display_time))
+    {
+        g_baseValid = false;
         g_screenPlaced = false;
+    }
 
     if (g_frame.should_render && !g_screenPlaced)
         PlaceScreen();
+
+    PublishViews();
 
     // Input only belongs to the game while the headset has focus (not in the dashboard).
     g_inputFocused = g_runtime->IsSessionFocused();
@@ -315,20 +392,23 @@ void VR::BeginFrame()
         XrInput::Idle();
 }
 
-plume::RenderTexture* VR::AcquireScreenImage()
+void VR::AcquireImages(VRImages& images)
 {
     std::lock_guard lock(g_mutex);
 
+    images = {};
+
     if (!g_frameBegun || !g_frame.should_render)
-        return nullptr;
+        return;
 
-    if (!AcquireSwapchain(g_screenSwapchain))
-        return nullptr;
-
-    return g_screenSwapchain.images[g_screenSwapchain.acquiredIndex].get();
+    // Whether this frame shows the world or the screen is only known once the
+    // render thread has seen its draws, so all three images are acquired.
+    images.screen = AcquireSwapchain(g_screenSwapchain);
+    images.eyes[0] = AcquireSwapchain(g_eyeSwapchains[0]);
+    images.eyes[1] = AcquireSwapchain(g_eyeSwapchains[1]);
 }
 
-bool VR::EndFrame()
+bool VR::EndFrame(const VRFrameResult& result)
 {
     std::lock_guard lock(g_mutex);
 
@@ -337,13 +417,62 @@ bool VR::EndFrame()
 
     g_frameBegun = false;
 
-    // The render thread's commands into the image were submitted to the queue
-    // the session was created with, so the runtime orders its reads after them.
-    bool submitted = ReleaseSwapchain(g_screenSwapchain);
+    // The render thread's copies into the images were submitted to the queue the
+    // session was created with, so the runtime orders its reads after them.
+    bool screenReleased = ReleaseSwapchain(g_screenSwapchain);
+    bool leftReleased = ReleaseSwapchain(g_eyeSwapchains[0]);
+    bool rightReleased = ReleaseSwapchain(g_eyeSwapchains[1]);
 
-    if (!submitted || !g_frame.should_render)
+    VRFrameMode mode = result.mode;
+    if (mode == VRFrameMode::Immersive && !(leftReleased && rightReleased && result.views.valid))
+        mode = VRFrameMode::None;
+    else if (mode == VRFrameMode::Flat && !screenReleased)
+        mode = VRFrameMode::None;
+
+    if (mode != g_lastFrameMode)
+    {
+        static const char* const ModeNames[] = { "none", "flat screen", "immersive" };
+        LOGFN("[VR] Headset view: {}.", ModeNames[size_t(mode)]);
+        g_lastFrameMode = mode;
+    }
+
+    if (mode == VRFrameMode::None || !g_frame.should_render)
     {
         g_runtime->EndFrameWithoutLayers(g_frame);
+        return true;
+    }
+
+    if (mode == VRFrameMode::Immersive)
+    {
+        // Submit the poses the eyes were rendered with, never fresher ones: the
+        // compositor reprojects from these to the display time.
+        XrCompositionLayerProjectionView projectionViews[2]{};
+
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            const VRViews::Eye& eye = result.views.eyes[i];
+            XrCompositionLayerProjectionView& view = projectionViews[i];
+            view = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+            view.pose.orientation = { eye.orientation[0], eye.orientation[1], eye.orientation[2], eye.orientation[3] };
+            view.pose.position =
+            {
+                eye.position[0] + result.views.basePosition[0],
+                eye.position[1] + result.views.basePosition[1],
+                eye.position[2] + result.views.basePosition[2]
+            };
+            view.fov = { eye.angleLeft, eye.angleRight, eye.angleUp, eye.angleDown };
+            view.subImage.swapchain = g_eyeSwapchains[i].handle;
+            view.subImage.imageRect = { { 0, 0 }, { int32_t(g_eyeSwapchains[i].width), int32_t(g_eyeSwapchains[i].height) } };
+            view.subImage.imageArrayIndex = 0;
+        }
+
+        XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        projection.space = g_runtime->AppSpace();
+        projection.viewCount = 2;
+        projection.views = projectionViews;
+
+        const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection) };
+        g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
         return true;
     }
 
@@ -367,8 +496,9 @@ bool VR::EndFrame()
         quad.pose.position = { 0.0f, 0.0f, -std::max(0.25f, Config::VRScreenDistance.Value) };
     }
 
-    quad.size.width = std::max(0.25f, Config::VRScreenWidth.Value);
-    quad.size.height = quad.size.width * float(g_screenSwapchain.height) / float(g_screenSwapchain.width);
+    // VRScreenWidth is the width of a 16:9 screen; other shapes keep its height.
+    quad.size.height = std::max(0.25f, Config::VRScreenWidth.Value) * 9.0f / 16.0f;
+    quad.size.width = quad.size.height * float(g_screenSwapchain.width) / float(g_screenSwapchain.height);
 
     const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad) };
     g_runtime->EndFrame(g_frame, layers, uint32_t(std::size(layers)));
@@ -376,25 +506,32 @@ bool VR::EndFrame()
     return true;
 }
 
+void VR::GetViews(VRViews& views)
+{
+    std::lock_guard lock(g_viewsMutex);
+    views = g_views;
+}
+
 void VR::Recenter()
 {
     std::lock_guard lock(g_mutex);
+    g_baseValid = false;
     g_screenPlaced = false;
 }
 
-plume::RenderFormat VR::GetScreenFormat()
+plume::RenderFormat VR::GetImageFormat()
 {
-    return g_renderFormat;
+    return g_imageFormat;
 }
 
-uint32_t VR::GetScreenWidth()
+uint32_t VR::GetRenderWidth()
 {
-    return g_screenWidth;
+    return g_renderWidth;
 }
 
-uint32_t VR::GetScreenHeight()
+uint32_t VR::GetRenderHeight()
 {
-    return g_screenHeight;
+    return g_renderHeight;
 }
 
 bool VR::IsInputFocused()
