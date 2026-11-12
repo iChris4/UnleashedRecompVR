@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include "xxHashMap.h"
 #include <user/paths.h>
+#include <xr/xr.h>
 #include <SDL.h>
 
 struct XamListener : KernelObject
@@ -464,6 +465,39 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
             state->Gamepad.wButtons |= XAMINPUT_GAMEPAD_Y;
     }
 
+    // VR motion controllers, merged with any real pad: buttons combine, and each
+    // trigger and stick takes whichever input is pushed further.
+    XAMINPUT_GAMEPAD vrPad;
+    if (VR::GetGamepad(vrPad))
+    {
+        auto& pad = state->Gamepad;
+
+        auto mergeStick = [](int16_t& x, int16_t& y, int16_t vrX, int16_t vrY)
+        {
+            int32_t lengthSquared = int32_t(x) * int32_t(x) + int32_t(y) * int32_t(y);
+            int32_t vrLengthSquared = int32_t(vrX) * int32_t(vrX) + int32_t(vrY) * int32_t(vrY);
+            if (vrLengthSquared > lengthSquared)
+            {
+                x = vrX;
+                y = vrY;
+            }
+        };
+
+        pad.wButtons |= vrPad.wButtons;
+        pad.bLeftTrigger = std::max(pad.bLeftTrigger, vrPad.bLeftTrigger);
+        pad.bRightTrigger = std::max(pad.bRightTrigger, vrPad.bRightTrigger);
+        mergeStick(pad.sThumbLX, pad.sThumbLY, vrPad.sThumbLX, vrPad.sThumbLY);
+        mergeStick(pad.sThumbRX, pad.sThumbRY, vrPad.sThumbRX, vrPad.sThumbRY);
+
+        // Show controller button prompts (and allow rumble) once the controllers are used.
+        constexpr int16_t VR_STICK_ACTIVITY_THRESHOLD = 8000;
+        bool vrActive = vrPad.wButtons != 0 || vrPad.bLeftTrigger > 32 || vrPad.bRightTrigger > 32 ||
+            std::abs(vrPad.sThumbLX) > VR_STICK_ACTIVITY_THRESHOLD || std::abs(vrPad.sThumbLY) > VR_STICK_ACTIVITY_THRESHOLD;
+
+        if (vrActive && !hid::IsInputDeviceController())
+            hid::g_inputDevice = hid::EInputDevice::Xbox;
+    }
+
     state->Gamepad.wButtons &= ~hid::g_prohibitedButtons;
 
     if (hid::g_isLeftStickProhibited)
@@ -489,7 +523,13 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
 
 uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration)
 {
-    if (!hid::IsInputDeviceController() || !Config::Vibration)
+    if (!Config::Vibration)
+        return ERROR_SUCCESS;
+
+    // The motion controllers rumble regardless of the last device used on the desktop.
+    VR::SetRumble(ByteSwap(vibration->wLeftMotorSpeed), ByteSwap(vibration->wRightMotorSpeed));
+
+    if (!hid::IsInputDeviceController())
         return ERROR_SUCCESS;
 
     ByteSwapInplace(vibration->wLeftMotorSpeed);

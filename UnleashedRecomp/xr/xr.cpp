@@ -1,5 +1,6 @@
 #include "xr.h"
 #include "xr_d3d12.h"
+#include "xr_input.h"
 
 #include <vr/openxr_runtime.h>
 #include <os/logger.h>
@@ -28,6 +29,7 @@ static XrSwapchainState g_screenSwapchain;
 
 static PortVr::OpenXRFrame g_frame;
 static bool g_frameBegun;
+static std::atomic<bool> g_inputFocused;
 
 // The screen is placed once in the application space, in front of the head
 // with the head's heading, and stays there while the player looks around.
@@ -236,6 +238,9 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
     if (!CreateSwapchain(g_screenSwapchain, g_screenWidth, g_screenHeight, "screen"))
         return false;
 
+    if (!XrInput::Create(*g_runtime))
+        LOGN_WARNING("[VR] Motion controllers are unavailable; use a gamepad or the keyboard.");
+
     LOGFN("[VR] Session created on '{}' ({}). Screen {}x{}.",
         g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name, g_screenWidth, g_screenHeight);
 
@@ -256,11 +261,13 @@ void VR::Shutdown()
 
     if (g_runtime->HasSession())
     {
+        XrInput::Destroy();
         ReleaseSwapchain(g_screenSwapchain);
         DestroySwapchain(g_screenSwapchain);
     }
 
     g_frameBegun = false;
+    g_inputFocused = false;
     g_runtime->Shutdown();
     g_runtime.reset();
 }
@@ -274,7 +281,11 @@ void VR::BeginFrame()
 
     PortVr::OpenXREventStatus eventStatus = g_runtime->PollEvents();
     if (eventStatus != PortVr::OpenXREventStatus::Continue || !g_runtime->IsSessionRunning())
+    {
+        g_inputFocused = false;
+        XrInput::Idle();
         return;
+    }
 
     PortVr::OpenXRFrame frame;
     if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
@@ -288,8 +299,20 @@ void VR::BeginFrame()
     g_frame = frame;
     g_frameBegun = true;
 
+    // The runtime recentred (or otherwise moved) the application space: put the
+    // screen back in front of the head once the change is in effect.
+    if (g_runtime->ConsumeAppSpaceChangesThrough(g_frame.predicted_display_time))
+        g_screenPlaced = false;
+
     if (g_frame.should_render && !g_screenPlaced)
         PlaceScreen();
+
+    // Input only belongs to the game while the headset has focus (not in the dashboard).
+    g_inputFocused = g_runtime->IsSessionFocused();
+    if (g_inputFocused)
+        XrInput::Sync();
+    else
+        XrInput::Idle();
 }
 
 plume::RenderTexture* VR::AcquireScreenImage()
@@ -372,4 +395,19 @@ uint32_t VR::GetScreenWidth()
 uint32_t VR::GetScreenHeight()
 {
     return g_screenHeight;
+}
+
+bool VR::IsInputFocused()
+{
+    return g_inputFocused;
+}
+
+bool VR::GetGamepad(XAMINPUT_GAMEPAD& pad)
+{
+    return g_inputFocused && XrInput::GetGamepad(pad);
+}
+
+void VR::SetRumble(uint16_t leftMotorSpeed, uint16_t rightMotorSpeed)
+{
+    XrInput::SetRumble(leftMotorSpeed, rightMotorSpeed);
 }

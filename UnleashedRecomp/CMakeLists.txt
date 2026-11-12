@@ -201,6 +201,7 @@ if (UNLEASHED_RECOMP_OPENXR)
     set(UNLEASHED_RECOMP_XR_CXX_SOURCES
         "xr/xr.cpp"
         "xr/xr_d3d12.cpp"
+        "xr/xr_input.cpp"
         "xr/core/openxr_runtime.cpp"
     )
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <plume_render_interface.h>
+#include <xbox.h>
 
 // OpenXR integration. The headset shows the game on a floating screen.
 //
@@ -44,7 +45,8 @@ struct VR
     // xrWaitFrame was ended, so the headset paced this frame.
     static bool EndFrame();
 
-    // Places the screen in front of the head again on the next frame.
+    // Places the screen in front of the head again on the next frame. The
+    // runtime's own recenter (a reference space change) does this too.
     static void Recenter();
 
     // The format to render the screen image in before it is copied into the
@@ -52,6 +54,17 @@ struct VR
     static plume::RenderFormat GetScreenFormat();
     static uint32_t GetScreenWidth();
     static uint32_t GetScreenHeight();
+
+    // The headset has input focus: the player is in the game rather than the
+    // runtime's dashboard. Input then counts as focused even if the window is not.
+    static bool IsInputFocused();
+
+    // The motion controllers as a pad (host byte order), as of the last frame.
+    // False when no motion controller is bound.
+    static bool GetGamepad(XAMINPUT_GAMEPAD& pad);
+
+    // The game's rumble (XInput motor speeds), applied to the hands each frame.
+    static void SetRumble(uint16_t leftMotorSpeed, uint16_t rightMotorSpeed);
 #else
     // Builds without OpenXR: VR is never active.
     static bool Init() { return false; }
@@ -67,5 +80,8 @@ struct VR
     static plume::RenderFormat GetScreenFormat() { return plume::RenderFormat::B8G8R8A8_UNORM; }
     static uint32_t GetScreenWidth() { return 1920; }
     static uint32_t GetScreenHeight() { return 1080; }
+    static bool IsInputFocused() { return false; }
+    static bool GetGamepad(XAMINPUT_GAMEPAD&) { return false; }
+    static void SetRumble(uint16_t, uint16_t) {}
 #endif
 };

@@ -1,6 +1,7 @@
 #include "hid.h"
 #include <ui/game_window.h>
 #include <user/config.h>
+#include <xr/xr.h>
 
 hid::EInputDevice hid::g_inputDevice;
 hid::EInputDevice hid::g_inputDeviceController;
@@ -19,7 +20,8 @@ void hid::SetProhibitedInputs(uint16_t wButtons, bool leftStick, bool rightStick
 
 bool hid::IsInputAllowed()
 {
-    return GameWindow::s_isFocused || Config::AllowBackgroundInput;
+    // In VR the player looks at the headset, not the window; the headset's focus is what counts.
+    return GameWindow::s_isFocused || Config::AllowBackgroundInput || VR::IsInputFocused();
 }
 
 bool hid::IsInputDeviceController()
