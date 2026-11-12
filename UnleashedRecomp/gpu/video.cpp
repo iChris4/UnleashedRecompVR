@@ -1127,6 +1127,9 @@ static bool g_vrUiUsed;
 static bool g_vrNextDrawOnPanel;
 static bool g_vrScissorOnPanel;
 
+// The draw being flushed comes from DrawPrimitiveUP (for the VR log).
+static bool g_vrDrawIsUP;
+
 static bool g_vrViewsLatched;
 static VRViews g_vrViews;
 static VREyeState g_vrEyes[2];
@@ -1223,6 +1226,21 @@ struct VRDrawStatistics
     uint32_t lightShaftsBehind;
     float lastLightShaftGame[2];
     float lastLightShaftEye[2];
+
+    // Draws into the back buffer left over the whole view in stereo frames:
+    // CSD draws covering the canvas, full-screen 2D primitives, 2D draws from
+    // vertex buffers, and camera draws whose projection is not a perspective one;
+    // with the kind, shader, viewport and target of the last one, and for a
+    // camera draw its projection's scale and offset terms ([0], [5], [12], [13]).
+    uint32_t viewLockedCsd;
+    uint32_t viewLocked2D;
+    uint32_t viewLockedBuffer2D;
+    uint32_t viewLockedOrtho;
+    const char* lastViewLockedKind;
+    uint64_t lastViewLockedShader;
+    float lastViewLockedViewport[4];
+    uint32_t lastViewLockedTarget[2];
+    float lastViewLockedProjection[4];
 
     // 2D draws into the back buffer by other shaders than the HUD's.
     uint32_t twoDOnPanel;
@@ -1446,6 +1464,26 @@ static bool IsVRFrameImmersive()
     return g_vrPass >= 0 && g_vrViews.valid && g_vrCameraDrawCount > 0;
 }
 
+// Counts a draw into the back buffer left over the whole view of a stereo frame
+// (see VRDrawStatistics), keeping what the log shows of the last one.
+static void NoteVRViewLocked(uint32_t& counter, const char* kind)
+{
+    if (g_vrPass != 0 || !IsVRFrameImmersive())
+        return;
+
+    VRDrawStatistics& s = g_vrStatistics;
+    ++counter;
+    s.lastViewLockedKind = kind;
+    s.lastViewLockedShader = g_pipelineState.vertexShader != nullptr ? g_pipelineState.vertexShader->vrHash : 0;
+    s.lastViewLockedViewport[0] = g_viewport.x;
+    s.lastViewLockedViewport[1] = g_viewport.y;
+    s.lastViewLockedViewport[2] = g_viewport.width;
+    s.lastViewLockedViewport[3] = g_viewport.height;
+    s.lastViewLockedTarget[0] = g_renderTarget != nullptr ? g_renderTarget->width : 0;
+    s.lastViewLockedTarget[1] = g_renderTarget != nullptr ? g_renderTarget->height : 0;
+    memset(s.lastViewLockedProjection, 0, sizeof(s.lastViewLockedProjection));
+}
+
 static void SetVRHudOnPanel(bool onPanel)
 {
     if (onPanel)
@@ -1525,11 +1563,13 @@ static void NoteVRUnhandled2D(GuestShader* shader, uint32_t stride, uint32_t pos
 }
 
 // VR: a 2D draw into the back buffer by a shader of the game's own (menu text,
-// loading screens, the debug primitives) whose vertices are already in
-// normalised device coordinates: in stereo frames its uploaded vertices are
-// moved onto the HUD panel for the eye being drawn, unless it covers the
-// whole screen. `uploaded` is the little-endian copy the GPU reads,
-// `vertices` the game's big-endian data. Returns whether the draw was moved.
+// loading screens, transitions, the debug primitives) whose vertices are
+// already in clip space with w = 1: in stereo frames its uploaded vertices are
+// moved onto the HUD panel for the eye being drawn. A draw covering exactly the
+// screen (a filter or a fade) stays over the whole view; one reaching well past
+// it is an element zooming in or out, and goes on the panel. `uploaded` is the
+// little-endian copy the GPU reads, `vertices` the game's big-endian data.
+// Returns whether the draw was moved.
 //
 // A float4 position gets the panel's perspective in its w. A float3 one (the
 // shader supplies w = 1, as FxFilterT does) gets the divided position, so its
@@ -1587,9 +1627,9 @@ static bool PlaceVR2DPrimitiveOnPanel(const uint8_t* vertices, uint8_t* uploaded
         float y = loadFloat(offset + 4);
         float w = hasW ? loadFloat(offset + 12) : 1.0f;
 
-        if (std::abs(x) > 1.05f || std::abs(y) > 1.05f || std::abs(w - 1.0f) > 0.01f)
+        if (std::abs(w - 1.0f) > 0.01f)
         {
-            NoteVRUnhandled2D(vertexShader, stride, positionType, "not normalised");
+            NoteVRUnhandled2D(vertexShader, stride, positionType, "w not 1");
             return false;
         }
 
@@ -1599,11 +1639,15 @@ static bool PlaceVR2DPrimitiveOnPanel(const uint8_t* vertices, uint8_t* uploaded
         maxY = std::max(maxY, y);
     }
 
-    if (minX <= -0.99f && minY <= -0.99f && maxX >= 0.99f && maxY >= 0.99f)
+    bool coversScreen = minX <= -0.99f && minY <= -0.99f && maxX >= 0.99f && maxY >= 0.99f;
+    bool withinScreen = minX >= -1.05f && minY >= -1.05f && maxX <= 1.05f && maxY <= 1.05f;
+
+    if (coversScreen && withinScreen)
     {
         if (g_vrPass == 0)
             ++g_vrStatistics.twoDFullScreen;
 
+        NoteVRViewLocked(g_vrStatistics.viewLocked2D, "2D full screen");
         return false;
     }
 
@@ -1645,8 +1689,8 @@ static bool PlaceVR2DPrimitiveOnPanel(const uint8_t* vertices, uint8_t* uploaded
     return true;
 }
 
-// Whether a CSD draw covers the whole canvas (a screen fade, a dimmed
-// background): those stay over the whole view rather than going on the panel.
+// Whether a CSD draw covers the whole canvas. Untextured ones (a screen fade, a
+// dimmed background) stay over the whole view rather than going on the panel.
 // Positions are the first two (big-endian) floats of each vertex, in the pixels
 // of the viewport size the CSD vertex shader divides by (register c180).
 static bool CoversVRHudCanvas(const uint8_t* vertices, uint32_t size, uint32_t stride)
@@ -1942,6 +1986,15 @@ static VRDrawKind GetVRDrawKind(GuestSurface* renderTarget, GuestSurface* depthS
             g_vrStatistics.lastNotPerspectiveHeight = surface != nullptr ? surface->height : 0;
             g_vrStatistics.lastNotPerspective23 = projection23;
             g_vrStatistics.lastNotPerspective33 = projection33;
+
+            if (renderTarget == g_backBuffer && IsVRFrameImmersive())
+            {
+                NoteVRViewLocked(g_vrStatistics.viewLockedOrtho, "camera, not perspective");
+                g_vrStatistics.lastViewLockedProjection[0] = LoadGuestConstant(g_vertexShaderConstants, projection + 0);
+                g_vrStatistics.lastViewLockedProjection[1] = LoadGuestConstant(g_vertexShaderConstants, projection + 5);
+                g_vrStatistics.lastViewLockedProjection[2] = LoadGuestConstant(g_vertexShaderConstants, projection + 12);
+                g_vrStatistics.lastViewLockedProjection[3] = LoadGuestConstant(g_vertexShaderConstants, projection + 13);
+            }
         }
 
         return VRDrawKind::None;
@@ -2061,6 +2114,18 @@ static void LogVRStatistics()
         s.bloomFeedbackReplaced, s.lastBloomPersistence, s.bloomHistoryFromOwnTarget,
         s.lightShaftPasses, s.lightShaftsBehind, s.lastLightShaftGame[0], s.lastLightShaftGame[1],
         s.lastLightShaftEye[0], s.lastLightShaftEye[1]);
+
+    if (s.viewLockedCsd != 0 || s.viewLocked2D != 0 || s.viewLockedBuffer2D != 0 || s.viewLockedOrtho != 0)
+    {
+        LOGFN("[VR] Last 5 s, back-buffer draws left over the whole view: untextured CSD covering the canvas {}, 2D full screen {}, "
+            "2D from vertex buffers {}, camera draws not perspective {} (last: {}, shader {:016X}, viewport {:.0f},{:.0f} {:.0f}x{:.0f} "
+            "of {}x{}, projection {:.4f} {:.4f} {:.4f} {:.4f}).",
+            s.viewLockedCsd, s.viewLocked2D, s.viewLockedBuffer2D, s.viewLockedOrtho,
+            s.lastViewLockedKind != nullptr ? s.lastViewLockedKind : "-", s.lastViewLockedShader,
+            s.lastViewLockedViewport[0], s.lastViewLockedViewport[1], s.lastViewLockedViewport[2], s.lastViewLockedViewport[3],
+            s.lastViewLockedTarget[0], s.lastViewLockedTarget[1],
+            s.lastViewLockedProjection[0], s.lastViewLockedProjection[1], s.lastViewLockedProjection[2], s.lastViewLockedProjection[3]);
+    }
 
     if (s.reflectionMapReads != 0 || s.reflectionMapDraws != 0 || s.reflectionPerEye != 0)
     {
@@ -6418,7 +6483,16 @@ static void FlushRenderStateForRenderThread()
     // shafts head for the light as the eye sees it.
     // Constants uploaded for one kind of draw are not reused for another.
     if (g_vrPass == 0)
+    {
         NoteVRReflectionMapRead(renderTarget);
+
+        GuestShader* vertexShader = g_pipelineState.vertexShader;
+        if (!g_vrDrawIsUP && renderTarget == g_backBuffer && vertexShader != nullptr &&
+            vertexShader->vrProjectionRegister < 0 && !vertexShader->vrHudShader)
+        {
+            NoteVRViewLocked(g_vrStatistics.viewLockedBuffer2D, "2D from a vertex buffer");
+        }
+    }
 
     VRDrawKind vrDrawKind = (g_vrPass >= 0) ? GetVRDrawKind(renderTarget, depthStencil) : VRDrawKind::None;
     bool vrNeutraliseBoost = ShouldNeutraliseVRBoostPass();
@@ -6709,14 +6783,22 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
             args.csdFilterState == CsdFilterState::On ? g_csdFilterShader.get() : g_csdShader);
     }
 
-    // VR: in stereo frames the HUD goes on a panel, except what covers the whole screen.
+    // VR: in stereo frames the HUD goes on a panel, except plain colour over the
+    // whole screen (fades). Textured draws go on it even when they cover the
+    // canvas: pictures fading in, and elements zooming in from beyond the screen.
     if (g_pipelineState.vertexShader != nullptr && g_pipelineState.vertexShader->vrHudShader)
     {
-        SetVRHudOnPanel(IsVRFrameImmersive() &&
-            !CoversVRHudCanvas(args.vertexStreamZeroData, args.vertexStreamZeroSize, args.vertexStreamZeroStride));
+        bool untextured = g_pipelineState.vertexShader->vrHash == 0xB1086A4947A797DE; // csd_no_tex_vs
+        bool viewLocked = untextured && CoversVRHudCanvas(args.vertexStreamZeroData, args.vertexStreamZeroSize, args.vertexStreamZeroStride);
+        SetVRHudOnPanel(IsVRFrameImmersive() && !viewLocked);
+
+        if (viewLocked)
+            NoteVRViewLocked(g_vrStatistics.viewLockedCsd, "untextured CSD covering the canvas");
     }
 
+    g_vrDrawIsUP = true;
     FlushRenderStateForRenderThread();
+    g_vrDrawIsUP = false;
 
     if (indexCount != 0)
         g_commandLists[g_frame]->drawIndexedInstanced(indexCount, 1, 0, 0, 0);
@@ -7130,6 +7212,7 @@ static GuestShader* CreateShader(const be<uint32_t>* function, ResourceType reso
                 shader->shaderCacheEntry = findResult;
 
             shader->vrHudShader = (hash == 0xB1086A4947A797DE || hash == 0xB4CAFC034A37C8A8);
+            shader->vrHash = hash;
 
             if (hash == 0xD44C189D5067922E) // FxBoostBlur.xpu
                 shader->vrBoostShader = VR_BOOST_SHADER_FX_BOOST_BLUR;

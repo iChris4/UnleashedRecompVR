@@ -315,6 +315,9 @@ struct GuestShader : GuestResource
     // VR: the light shaft pass, which blurs towards the sun's position on screen.
     bool vrLightShaftShader = false;
 
+    // VR: the shader's hash, for the VR log.
+    uint64_t vrHash = 0;
+
     // VR: the sampler register of the planar reflection map (g_ReflectionMapSampler), or -1.
     int8_t vrReflectionSamplerRegister = -1;
 #ifdef UNLEASHED_RECOMP_D3D12
