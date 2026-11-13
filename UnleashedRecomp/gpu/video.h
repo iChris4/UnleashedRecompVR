@@ -346,6 +346,11 @@ struct GuestShader : GuestResource
     // VR: the sampler registers the shader declares, from its constant table (all
     // of them when it has none), for the surface dump.
     uint16_t vrSamplerMask = 0xFFFF;
+
+    // VR: the float constant registers the shader declares, from its constant
+    // table (all of them when it has none, as for the host's own shaders): the
+    // only ones uploaded for it ([VR] VRPartialConstantUploads).
+    uint64_t vrConstantMask[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
 #ifdef UNLEASHED_RECOMP_D3D12
     std::vector<ComPtr<IDxcBlob>> shaderBlobs;
     ComPtr<IDxcBlobEncoding> libraryBlob;

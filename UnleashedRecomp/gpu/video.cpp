@@ -1193,6 +1193,25 @@ static VRStereoDraw g_vrStereoDraw = VRStereoDraw::LeftEye;
 static uint32_t g_vrVertexConstantBlocks = 1;
 static uint32_t g_vrPixelConstantBlocks = 1;
 
+// VR: only the constant registers the shaders declare are uploaded ([VR]
+// VRPartialConstantUploads), and the registers the last uploads hold. Fixed for
+// the run once the session exists.
+static bool g_vrPartialConstantUploads;
+static uint64_t g_vrUploadedVertexConstants[4];
+static uint64_t g_vrUploadedPixelConstants[4];
+
+static constexpr uint64_t VR_ALL_CONSTANTS[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
+
+static const uint64_t* GetVRConstantMask(const GuestShader* shader)
+{
+    return (g_vrPartialConstantUploads && shader != nullptr) ? shader->vrConstantMask : VR_ALL_CONSTANTS;
+}
+
+static bool IsVRConstantSubset(const uint64_t* mask, const uint64_t* uploaded)
+{
+    return ((mask[0] & ~uploaded[0]) | (mask[1] & ~uploaded[1]) | (mask[2] & ~uploaded[2]) | (mask[3] & ~uploaded[3])) == 0;
+}
+
 // The layers of a render target or depth surface, and of a texture the game
 // resolves into: one per eye in single-pass stereo, except square ones (the
 // shadow maps, the luminance chain, cube faces) and small ones, drawn once for
@@ -1296,6 +1315,9 @@ static bool g_vrDrawIsUP;
 
 static bool g_vrViewsLatched;
 static VRViews g_vrViews;
+
+// Counts the views latched, so that what was computed from older ones is redone.
+static uint32_t g_vrViewsGeneration;
 
 static VREyeState g_vrEyes[2];
 static uint32_t g_vrCameraDrawCount;
@@ -1444,6 +1466,7 @@ struct VRDrawStatistics
     // the frame's command list (the last one measured), and pipelines the render
     // thread had to create itself.
     uint32_t timedFrames;
+    double constantUploadMs;
     double gameFrameMs;
     double gameFrameMaxMs;
     double gameUpdateMs;
@@ -1855,6 +1878,7 @@ static XrMatrix GetVRHorizonLock()
 static void LatchVRViews()
 {
     g_vrViewsLatched = true;
+    ++g_vrViewsGeneration;
 
     VR::GetViews(g_vrViews);
     if (!g_vrViews.valid)
@@ -2710,11 +2734,11 @@ static void LogVRStatistics()
 
         LOGFN("[VR] Last 5 s, timings per frame: game thread {:.2f} ms (max {:.2f}): update {:.2f} ms, render {:.2f} ms (max of both {:.2f}), "
             "waits for the headset {:.2f} ms, for the render thread {:.2f} ms, for the GPU {:.2f} ms. "
-            "Render thread {:.2f} ms (max {:.2f}), busy {:.2f} ms (max {:.2f}), of which draws {:.2f} ms. GPU {:.2f} ms (max {:.2f}). "
+            "Render thread {:.2f} ms (max {:.2f}), busy {:.2f} ms (max {:.2f}), of which draws {:.2f} ms (constant uploads {:.2f} ms). GPU {:.2f} ms (max {:.2f}). "
             "Pipelines created on the render thread: {} ({:.1f} ms).",
             s.gameFrameMs / n, s.gameFrameMaxMs, s.gameUpdateMs / n, s.gameRenderMs / n, s.gameWorkMaxMs,
             s.headsetWaitMs / n, s.renderThreadWaitMs / n, s.gpuFenceWaitMs / n,
-            s.frameSpanMs / n, s.frameSpanMaxMs, s.renderThreadBusyMs / n, s.renderThreadBusyMaxMs, s.drawMs / n,
+            s.frameSpanMs / n, s.frameSpanMaxMs, s.renderThreadBusyMs / n, s.renderThreadBusyMaxMs, s.drawMs / n, s.constantUploadMs / n,
             s.gpuFrameMs / n, s.gpuFrameMaxMs, s.renderThreadPipelines, s.renderThreadPipelineMs);
     }
 
@@ -2791,7 +2815,50 @@ struct VRCameraPatch
     float gameForward[3];
 };
 
+// The last camera patch computed for each eye, with the game's projection and
+// view it came from, and the views it was computed with (g_vrViewsGeneration):
+// draws through the same camera reuse it.
+struct VRCameraPatchCache
+{
+    bool valid;
+    uint32_t generation;
+    bool result;
+    uint32_t projection[16];
+    uint32_t view[16];
+    uint32_t viewCount;
+    VRCameraPatch patch;
+};
+
+static VRCameraPatchCache g_vrCameraPatchCache[2];
+
+static bool ComputeVRCameraPatchUncached(VRCameraPatch& patch, uint32_t eyeIndex);
+
 static bool ComputeVRCameraPatch(VRCameraPatch& patch, uint32_t eyeIndex)
+{
+    GuestShader* vertexShader = g_pipelineState.vertexShader;
+    VRCameraPatchCache& cache = g_vrCameraPatchCache[eyeIndex];
+
+    const uint32_t* projection = g_vertexShaderConstants + vertexShader->vrProjectionRegister * 4;
+    const uint32_t* view = g_vertexShaderConstants + vertexShader->vrViewRegister * 4;
+    uint32_t viewCount = vertexShader->vrViewRegisterCount * 4;
+
+    if (!cache.valid || cache.generation != g_vrViewsGeneration || cache.viewCount != viewCount ||
+        memcmp(cache.projection, projection, sizeof(cache.projection)) != 0 ||
+        memcmp(cache.view, view, viewCount * sizeof(uint32_t)) != 0)
+    {
+        cache.valid = true;
+        cache.generation = g_vrViewsGeneration;
+        cache.viewCount = viewCount;
+        memcpy(cache.projection, projection, sizeof(cache.projection));
+        memcpy(cache.view, view, viewCount * sizeof(uint32_t));
+        cache.result = ComputeVRCameraPatchUncached(cache.patch, eyeIndex);
+    }
+
+    patch = cache.patch;
+    return cache.result;
+}
+
+static bool ComputeVRCameraPatchUncached(VRCameraPatch& patch, uint32_t eyeIndex)
 {
     GuestShader* vertexShader = g_pipelineState.vertexShader;
     const VREyeState& eye = g_vrEyes[eyeIndex];
@@ -3032,19 +3099,19 @@ static void NoteVRBloomFeedback(GuestSurface* renderTarget)
         ++s.bloomHistoryFromOwnTarget;
 }
 
+// Both write uploaded constants and read the originals: upload memory is slow to read.
 static void ReplaceVRBloomFeedbackWeight(float* constants)
 {
-    float& weight = constants[150 * 4 + 2];
-    float persistence = std::clamp(weight, 0.0f, 0.75f);
-    weight = persistence / (1.0f - persistence);
+    float persistence = std::clamp(LoadGuestConstant(g_pixelShaderConstants, 150 * 4 + 2), 0.0f, 0.75f);
+    constants[150 * 4 + 2] = persistence / (1.0f - persistence);
 }
 
 static void ReplaceVRBloomFeedbackTexture(SharedConstants* constants)
 {
-    constants->texture2DIndices[1] = constants->texture2DIndices[0];
-    constants->texture3DIndices[1] = constants->texture3DIndices[0];
-    constants->textureCubeIndices[1] = constants->textureCubeIndices[0];
-    constants->samplerIndices[1] = constants->samplerIndices[0];
+    constants->texture2DIndices[1] = g_sharedConstants.texture2DIndices[0];
+    constants->texture3DIndices[1] = g_sharedConstants.texture3DIndices[0];
+    constants->textureCubeIndices[1] = g_sharedConstants.textureCubeIndices[0];
+    constants->samplerIndices[1] = g_sharedConstants.samplerIndices[0];
 }
 
 // The light shaft pass (LightShaftFilter) blurs the sky towards the sun's (or
@@ -3082,8 +3149,8 @@ static void PatchVRLightShafts(float* constants, uint32_t eyeIndex, bool count)
     // Texture coordinates to the game camera's view: a direction, so no translation.
     float gameDirection[3] =
     {
-        (sun[0] * 2.0f - 1.0f) / g_vrMainLensX,
-        (1.0f - sun[1] * 2.0f) / g_vrMainLensY,
+        (LoadGuestConstant(g_pixelShaderConstants, 166 * 4 + 0) * 2.0f - 1.0f) / g_vrMainLensX,
+        (1.0f - LoadGuestConstant(g_pixelShaderConstants, 166 * 4 + 1) * 2.0f) / g_vrMainLensY,
         -1.0f
     };
 
@@ -4122,6 +4189,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
             g_capabilities.vertexShaderLayerAndViewport ? "supported" : "not supported");
 
         g_vrSinglePass = Config::VRSinglePass && g_capabilities.vertexShaderLayerAndViewport;
+        g_vrPartialConstantUploads = Config::VRPartialConstantUploads;
 
         if (g_vrSinglePass)
         {
@@ -7391,18 +7459,41 @@ static void UploadSharedConstants()
 }
 
 // Uploads shader constants (byte-swapped), once or, for constants rewritten per
-// eye in single-pass stereo, once per eye. Upload memory is only written: reading
-// it back is very slow (write-combined, uncached).
+// eye in single-pass stereo, once per eye: the registers of the mask, the others
+// left as they are (the shader does not read them). Upload memory is only
+// written: reading it back is very slow (write-combined, uncached).
 template<size_t N>
-static UploadAllocation UploadShaderConstants(const uint32_t (&constants)[N], uint32_t blockCount)
+static UploadAllocation UploadShaderConstants(const uint32_t (&constants)[N], uint32_t blockCount, const uint64_t* registerMask)
 {
-    auto allocation = g_uploadAllocators[g_frame].allocate(sizeof(constants) * blockCount, 0x100);
-    auto destination = reinterpret_cast<uint32_t*>(allocation.memory);
+    constexpr size_t RegisterCount = N / 4;
 
-    for (uint32_t block = 0; block < blockCount; block++)
+    auto allocation = g_uploadAllocators[g_frame].allocate(sizeof(constants) * blockCount, 0x100);
+    auto blockMemory = reinterpret_cast<uint32_t*>(allocation.memory);
+
+    for (uint32_t block = 0; block < blockCount; block++, blockMemory += N)
     {
-        for (size_t i = 0; i < N; i++)
-            *destination++ = ByteSwap(constants[i]);
+        size_t first = 0;
+
+        while (first < RegisterCount)
+        {
+            uint64_t bits = registerMask[first / 64] >> (first % 64);
+            if (bits == 0)
+            {
+                first = (first / 64 + 1) * 64;
+                continue;
+            }
+
+            first += std::countr_zero(bits);
+            if (first >= RegisterCount)
+                break;
+
+            size_t last = std::min(RegisterCount, first + std::countr_one(registerMask[first / 64] >> (first % 64)));
+
+            for (size_t i = first * 4; i < last * 4; i++)
+                blockMemory[i] = ByteSwap(constants[i]);
+
+            first = last;
+        }
     }
 
     return allocation;
@@ -7617,6 +7708,18 @@ static void FlushRenderStateForRenderThread()
         SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.vrEyeMode, eyeMode);
     }
 
+    // Partial uploads: a shader needing registers the last upload lacks gets a new one.
+    const uint64_t* vertexConstantMask = GetVRConstantMask(g_pipelineState.vertexShader);
+    const uint64_t* pixelConstantMask = GetVRConstantMask(g_pipelineState.pixelShader);
+
+    if (!IsVRConstantSubset(vertexConstantMask, g_vrUploadedVertexConstants))
+        g_dirtyStates.vertexShaderConstants = true;
+
+    if (!IsVRConstantSubset(pixelConstantMask, g_vrUploadedPixelConstants))
+        g_dirtyStates.pixelShaderConstants = true;
+
+    auto vrUploadStart = std::chrono::steady_clock::now();
+
     // The eye of the first block: the eye frame replay draws, or the left eye.
     uint32_t vrFirstEye = (!g_vrSinglePass && g_vrPass > 0) ? uint32_t(g_vrPass) : 0;
     uint32_t vrPatchedEyes = std::max(vrVertexBlocks, vrPixelBlocks);
@@ -7632,7 +7735,8 @@ static void FlushRenderStateForRenderThread()
 
     if (g_dirtyStates.vertexShaderConstants)
     {
-        auto vertexShaderConstants = UploadShaderConstants(g_vertexShaderConstants, vrVertexBlocks);
+        auto vertexShaderConstants = UploadShaderConstants(g_vertexShaderConstants, vrVertexBlocks, vertexConstantMask);
+        memcpy(g_vrUploadedVertexConstants, vertexConstantMask, sizeof(g_vrUploadedVertexConstants));
 
         for (uint32_t i = 0; i < vrVertexBlocks; i++)
         {
@@ -7652,7 +7756,8 @@ static void FlushRenderStateForRenderThread()
 
     if (g_dirtyStates.pixelShaderConstants)
     {
-        auto pixelShaderConstants = UploadShaderConstants(g_pixelShaderConstants, vrPixelBlocks);
+        auto pixelShaderConstants = UploadShaderConstants(g_pixelShaderConstants, vrPixelBlocks, pixelConstantMask);
+        memcpy(g_vrUploadedPixelConstants, pixelConstantMask, sizeof(g_vrUploadedPixelConstants));
 
         for (uint32_t i = 0; i < vrPixelBlocks; i++)
         {
@@ -7680,6 +7785,8 @@ static void FlushRenderStateForRenderThread()
 
         SetRootDescriptor(pixelShaderConstants, 1);
     }
+
+    g_vrStatistics.constantUploadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vrUploadStart).count();
 
     if (g_dirtyStates.sharedConstants)
         UploadSharedConstants();
@@ -8269,6 +8376,7 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
     constexpr uint16_t RegisterSetSampler = 3;
 
     shader->vrSamplerMask = 0;
+    memset(shader->vrConstantMask, 0, sizeof(shader->vrConstantMask));
 
     for (uint32_t i = 0; i < constantCount; i++)
     {
@@ -8286,6 +8394,12 @@ static void FindVRCameraConstants(GuestShader* shader, const be<uint32_t>* funct
             continue;
 
         std::string_view name(reinterpret_cast<const char*>(table + nameOffset), strnlen(reinterpret_cast<const char*>(table + nameOffset), tableSize - nameOffset));
+
+        if (registerSet == RegisterSetFloat4)
+        {
+            for (uint32_t j = registerIndex; j < uint32_t(registerIndex) + std::max<uint16_t>(registerCount, 1) && j < 256; j++)
+                shader->vrConstantMask[j / 64] |= 1ull << (j % 64);
+        }
 
         if (registerSet == RegisterSetSampler)
         {
