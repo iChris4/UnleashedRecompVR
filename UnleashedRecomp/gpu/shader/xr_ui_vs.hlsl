@@ -1,9 +1,10 @@
 #include "../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
 #include "vr_stereo.hlsli"
 
-// VR: the UI texture as a quad on the HUD panel, for one eye. The panel
-// transform takes the canvas in normalised device coordinates to clip space:
-// clip = [x, y, 0, 1] * g_PanelMatrix (row vectors).
+// VR: the UI texture as a quad on the HUD panel. The panel transform takes the
+// canvas in normalised device coordinates to clip space: clip = [x, y, 0, 1] *
+// panel matrix (row vectors). The constants hold the matrix of the eye drawn,
+// or in stereo both eyes' (an instance each).
 
 #ifdef __spirv__
 
@@ -13,11 +14,11 @@
 
 cbuffer SharedConstants : register(b2, space4)
 {
-    float4 g_PanelMatrix[4] : packoffset(c0);
-    uint g_TextureDescriptorIndex : packoffset(c4.x);
+    float4 g_PanelMatrices[8] : packoffset(c0);
+    uint g_TextureDescriptorIndex : packoffset(c8.x);
 };
 
-#define g_PanelRow(INDEX) g_PanelMatrix[INDEX]
+#define g_PanelRow(INDEX) g_PanelMatrices[INDEX]
 
 #endif
 
@@ -34,6 +35,7 @@ void main(in uint vertexId : SV_VertexID VR_VS_INSTANCE_INPUT, out float4 positi
     texCoord = corners[vertexId];
 
     float2 ndc = float2(texCoord.x * 2.0 - 1.0, 1.0 - texCoord.y * 2.0);
-    position = ndc.x * g_PanelRow(0) + ndc.y * g_PanelRow(1) + g_PanelRow(3);
+    uint row = VR_VS_EYE * 4;
+    position = ndc.x * g_PanelRow(row + 0) + ndc.y * g_PanelRow(row + 1) + g_PanelRow(row + 3);
     position.z = 0.0;
 }

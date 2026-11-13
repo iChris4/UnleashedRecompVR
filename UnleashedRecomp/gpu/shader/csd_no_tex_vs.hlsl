@@ -17,8 +17,10 @@ cbuffer VertexShaderConstants : register(b0, space4)
 cbuffer SharedConstants : register(b2, space4)
 {
 	DEFINE_SHARED_CONSTANTS();
+#ifndef VR_STEREO
     float4 g_VRHudMatrix[4] : packoffset(c18);
-    uint g_VRHudEnabled : packoffset(c22.x);
+    uint g_VRHudEnabled : packoffset(c26.x);
+#endif
 };
 
 #endif
@@ -49,7 +51,7 @@ void main(
 	out float4 oColor1 : COLOR1 VR_VS_LAYER_OUTPUTS)
 {
     VR_GAME_VS_EYE();
-    oPos = ApplyVRHud(iPosition0.xy * g_ViewportSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0), g_Z.x);
+    oPos = ApplyVRHud(iPosition0.xy * g_ViewportSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0), g_Z.x, VR_VS_EYE);
     oTexCoord0 = iColor0.wxyz;
     oTexCoord1 = 0.0;
     oTexCoord2 = 0.0;

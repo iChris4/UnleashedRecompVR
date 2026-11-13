@@ -5,5 +5,6 @@ VR_TEXTURE_2D(float4) g_Texture2DDescriptorHeap[] : register(t0, space0);
 
 float4 main(in float4 position : SV_Position VR_PS_EYE_INPUTS) : SV_Target
 {
-    return g_Texture2DDescriptorHeap[g_PushConstants.ResourceDescriptorIndex].Load(VR_LOAD_COORD(position.xy, VR_PS_EYE));
+    VR_TEXTURE_2D(float4) texture = g_Texture2DDescriptorHeap[g_PushConstants.ResourceDescriptorIndex];
+    return texture.Load(VR_LOAD_COORD(position.xy, VR_SOURCE_LAYER(texture)));
 }

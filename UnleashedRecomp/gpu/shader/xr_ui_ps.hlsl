@@ -6,13 +6,13 @@
 
 #ifdef __spirv__
 
-#define g_TextureDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 64)
+#define g_TextureDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 128)
 
 #else
 
 cbuffer SharedConstants : register(b2, space4)
 {
-    uint g_TextureDescriptorIndex : packoffset(c4.x);
+    uint g_TextureDescriptorIndex : packoffset(c8.x);
 };
 
 #endif

@@ -34,6 +34,28 @@
 
 #define VR_PS_EYE iEye
 
+// The eye a vertex shader draws for, once VR_HOST_VS_EYE or VR_GAME_VS_EYE set it.
+#define VR_VS_EYE eye
+
+// The layer of a copy's source the eye reads: its own, or the only layer of a
+// source drawn for one eye (the copy drawing into every layer of its target).
+template<typename T> uint VRSourceLayer(T texture, uint eye)
+{
+    uint width, height, layerCount;
+    texture.GetDimensions(width, height, layerCount);
+    return min(eye, layerCount - 1);
+}
+
+template<typename T> uint VRSourceLayerMS(T texture, uint eye)
+{
+    uint width, height, layerCount, sampleCount;
+    texture.GetDimensions(width, height, layerCount, sampleCount);
+    return min(eye, layerCount - 1);
+}
+
+#define VR_SOURCE_LAYER(texture) VRSourceLayer(texture, VR_PS_EYE)
+#define VR_SOURCE_LAYER_MS(texture) VRSourceLayerMS(texture, VR_PS_EYE)
+
 // Draws the host issues itself: two instances draw both eyes into a two-layer
 // target, one instance the left eye into layer 0.
 #define VR_HOST_VS_EYE() uint eye = iStereoInstanceId & 1; oEye = eye; oLayer = eye; oViewport = eye
@@ -73,6 +95,10 @@
 #define VR_VS_LAYER_OUTPUTS
 #define VR_PS_EYE_INPUTS
 #define VR_PS_EYE 0
+#define VR_VS_EYE 0
+
+#define VR_SOURCE_LAYER(texture) 0
+#define VR_SOURCE_LAYER_MS(texture) 0
 
 #define VR_HOST_VS_EYE()
 #define VR_GAME_VS_EYE()

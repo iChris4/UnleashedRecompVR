@@ -151,6 +151,10 @@ struct GuestBaseTexture : GuestResource
     uint32_t descriptorIndex = 0;
     RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
 
+    // VR single-pass stereo: a layer per eye, or one drawn for the left eye that
+    // both eyes read.
+    uint32_t layerCount = 1;
+
     GuestBaseTexture(ResourceType type) : GuestResource(type)
     {
     }
