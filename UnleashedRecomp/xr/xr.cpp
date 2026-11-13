@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 struct XrSwapchainState
@@ -70,6 +72,46 @@ static std::atomic<bool> g_keepAliveRunning;
 
 static void StartKeepAlive();
 static void StopKeepAlive();
+
+// The pacing thread ([VR] VRPacingThread, replacing the keep-alive): a thread of
+// its own runs the headset's frame loop (xrWaitFrame, xrBeginFrame, xrEndFrame)
+// at the headset's rate. The game hands it finished frames (the layer it
+// retains, with the images it released), and each cycle ends with the newest
+// one: a fresh frame when the game delivered in time, else the previous one
+// again, which the compositor reprojects for the head's new pose. A game frame
+// that overruns a headset cycle then costs no more than its own time, where
+// waiting in xrWaitFrame for the next cycle costs the rest of a whole one.
+//
+// The game still draws at most one frame per headset cycle: it begins a frame
+// only for a cycle it has not drawn for yet, and waits for the next one
+// otherwise. Everything below is guarded by g_mutex; the thread only leaves it
+// for xrWaitFrame and while it waits for the game's frame.
+static bool g_pacingEnabled;
+static std::thread g_pacingThread;
+static std::atomic<bool> g_pacingRunning;
+static std::condition_variable g_pacingCondition;
+
+// The headset cycles begun so far, the last one's frame state and when its
+// xrWaitFrame returned, and whether the session is running.
+static uint64_t g_pacingCycle;
+static XrFrameState g_pacingFrameState{ XR_TYPE_FRAME_STATE };
+static std::chrono::steady_clock::time_point g_pacingCycleTime;
+static bool g_pacingSessionRunning;
+
+// How long xrEndFrame takes (smoothed), which the wait for the game's frame
+// leaves room for.
+static double g_pacingEndFrameMs = 0.5;
+
+// The frames the game handed over, the cycle its last frame was begun for, and
+// how long its frames take from their beginning to their handover (smoothed).
+static uint64_t g_publishSerial;
+static uint64_t g_gameCycle;
+static std::chrono::steady_clock::time_point g_gameFrameBeginTime;
+static double g_gameFrameMs = 8.0;
+
+static void StartPacing();
+static void StopPacing();
+
 static XrSwapchainState g_screenSwapchain;
 static XrSwapchainState g_eyeSwapchains[2];
 
@@ -436,7 +478,18 @@ bool VR::CreateSession(plume::RenderDevice* device, plume::RenderCommandQueue* q
     LOGFN("[VR] Session created on '{}' ({}, {}).", g_runtime->RuntimeInfo().system_name, g_runtime->RuntimeInfo().runtime_name,
         g_vulkanBackend ? "Vulkan" : "D3D12");
 
-    StartKeepAlive();
+    g_pacingEnabled = Config::VRPacingThread;
+
+    if (g_pacingEnabled)
+    {
+        LOGN("[VR] The headset is paced by a thread of its own.");
+        StartPacing();
+    }
+    else
+    {
+        StartKeepAlive();
+    }
+
     return true;
 }
 
@@ -448,6 +501,7 @@ bool VR::IsActive()
 void VR::Shutdown()
 {
     StopKeepAlive();
+    StopPacing();
 
     std::lock_guard lock(g_mutex);
 
@@ -480,35 +534,90 @@ void VR::Shutdown()
     g_views = {};
 }
 
+// Begins the game's frame with the pacing thread: for a headset cycle the game
+// has not drawn for yet, waiting for the next one if need be. g_mutex is held.
+// False when the headset wants no frame.
+static bool BeginPacedFrame(std::unique_lock<std::mutex>& lock, PortVr::OpenXRFrame& frame)
+{
+    if (!g_pacingSessionRunning)
+        return false;
+
+    bool cycleReady = g_pacingCondition.wait_for(lock, std::chrono::milliseconds(100), []()
+        {
+            return g_pacingCycle != g_gameCycle || !g_pacingSessionRunning || !g_pacingRunning;
+        });
+
+    if (!cycleReady || !g_pacingSessionRunning || !g_pacingRunning || g_runtime == nullptr || !g_runtime->HasSession())
+        return false;
+
+    g_gameCycle = g_pacingCycle;
+
+    auto now = std::chrono::steady_clock::now();
+    g_gameFrameBeginTime = now;
+
+    // The cycle the frame will be shown in, from how long the game's frames
+    // take: this one while it can be handed over before the cycle ends, else a
+    // later one, whose display time the eyes are then located for.
+    double periodMs = double(g_pacingFrameState.predictedDisplayPeriod) / 1.0e6;
+    int64_t cyclesAhead = 0;
+
+    if (periodMs > 1.0)
+    {
+        double sinceCycleMs = std::chrono::duration<double, std::milli>(now - g_pacingCycleTime).count();
+        double handoverMs = sinceCycleMs + g_gameFrameMs;
+        double deadlineMs = periodMs - g_pacingEndFrameMs - 1.0;
+
+        if (handoverMs > deadlineMs)
+            cyclesAhead = std::clamp(int64_t(ceil((handoverMs - deadlineMs) / periodMs)), int64_t(0), int64_t(3));
+    }
+
+    frame = {};
+    frame.predicted_display_period = g_pacingFrameState.predictedDisplayPeriod;
+    frame.should_render = g_pacingFrameState.shouldRender == XR_TRUE;
+    frame.predicted_display_time = g_pacingFrameState.predictedDisplayTime + cyclesAhead * g_pacingFrameState.predictedDisplayPeriod;
+
+    g_runtime->LocateViewsAt(frame.predicted_display_time, frame);
+    return true;
+}
+
 void VR::BeginFrame()
 {
-    std::lock_guard lock(g_mutex);
+    std::unique_lock lock(g_mutex);
 
     if (g_runtime == nullptr || !g_runtime->HasSession() || g_frameBegun)
         return;
 
-    PortVr::OpenXREventStatus eventStatus = g_runtime->PollEvents();
-    if (eventStatus != PortVr::OpenXREventStatus::Continue || !g_runtime->IsSessionRunning())
-    {
-        g_inputFocused = false;
-        XrInput::Idle();
-        return;
-    }
-
     PortVr::OpenXRFrame frame;
-    if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
-        return;
 
-    bool begun;
+    if (g_pacingEnabled)
     {
-        auto queueLock = LockGraphicsQueue();
-        begun = g_runtime->BeginFrame(frame);
+        if (!BeginPacedFrame(lock, frame))
+            return;
     }
+    else
+    {
+        PortVr::OpenXREventStatus eventStatus = g_runtime->PollEvents();
+        if (eventStatus != PortVr::OpenXREventStatus::Continue || !g_runtime->IsSessionRunning())
+        {
+            g_inputFocused = false;
+            XrInput::Idle();
+            return;
+        }
 
-    if (!begun)
-        return;
+        if (g_runtime->WaitFrame(frame) != PortVr::OpenXRFrameStatus::Ready)
+            return;
 
-    g_runtime->LocateViews(frame);
+        bool begun;
+        {
+            auto queueLock = LockGraphicsQueue();
+            begun = g_runtime->BeginFrame(frame);
+        }
+
+        if (!begun)
+            return;
+
+        g_runtime->LocateViews(frame);
+    }
 
     g_frame = frame;
     g_frameBegun = true;
@@ -654,6 +763,223 @@ static void KeepAlive()
     EndFrameWithLayer(frame, g_retainedLayer);
 }
 
+// Ends a headset cycle of the pacing thread with a layer (or none). g_mutex is held.
+static XrResult EndPacedFrame(XrSession session, const XrFrameState& state, const RetainedLayer& layer)
+{
+    XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    const XrCompositionLayerBaseHeader* layers[1]{};
+    uint32_t layerCount = 0;
+
+    if (state.shouldRender == XR_TRUE && layer.mode == VRFrameMode::Immersive)
+    {
+        projection.space = g_runtime->AppSpace();
+        projection.viewCount = 2;
+        projection.views = layer.views;
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+    }
+    else if (state.shouldRender == XR_TRUE && layer.mode == VRFrameMode::Flat)
+    {
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer.quad);
+    }
+
+    XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
+    endInfo.displayTime = state.predictedDisplayTime;
+    endInfo.environmentBlendMode = g_runtime->EnvironmentBlendMode();
+    endInfo.layerCount = layerCount;
+    endInfo.layers = layerCount != 0 ? layers : nullptr;
+
+    auto queueLock = LockGraphicsQueue();
+    return xrEndFrame(session, &endInfo);
+}
+
+// What the pacing thread did, logged every few seconds.
+struct PacingStatistics
+{
+    uint32_t cycles;
+    uint32_t freshFrames;
+    uint32_t repeatedFrames;
+    uint32_t emptyFrames;
+    double contentWaitMs;
+    double endFrameMs;
+    double endFrameMaxMs;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+
+// One headset cycle of the pacing thread.
+static void PaceFrame()
+{
+    static PacingStatistics s_statistics;
+    static uint64_t s_consumedSerial;
+    static std::chrono::steady_clock::time_point s_lastCycleTime;
+    static bool s_repeating;
+
+    XrSession session = XR_NULL_HANDLE;
+    {
+        std::unique_lock lock(g_mutex);
+
+        bool running = false;
+        if (g_runtime != nullptr && g_runtime->HasSession())
+        {
+            PortVr::OpenXREventStatus eventStatus = g_runtime->PollEvents();
+            running = eventStatus == PortVr::OpenXREventStatus::Continue && g_runtime->IsSessionRunning();
+            session = g_runtime->Session();
+        }
+
+        if (running != g_pacingSessionRunning)
+        {
+            g_pacingSessionRunning = running;
+            g_pacingCondition.notify_all();
+        }
+
+        if (!running)
+        {
+            g_inputFocused = false;
+            XrInput::Idle();
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return;
+        }
+    }
+
+    // Blocks until the headset wants its next frame. Never under g_mutex or the
+    // graphics queue's lock: the game works meanwhile.
+    XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+    XrFrameState state{ XR_TYPE_FRAME_STATE };
+    XrResult result = xrWaitFrame(session, &waitInfo, &state);
+    auto cycleTime = std::chrono::steady_clock::now();
+
+    std::unique_lock lock(g_mutex);
+    g_runtime->ObserveResult(result);
+
+    if (XR_FAILED(result))
+    {
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
+
+    {
+        XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+        auto queueLock = LockGraphicsQueue();
+        result = xrBeginFrame(session, &beginInfo);
+    }
+
+    g_runtime->ObserveResult(result);
+
+    if (XR_FAILED(result))
+    {
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
+
+    // The game may now begin a frame for this cycle.
+    double lastCycleMs = std::chrono::duration<double, std::milli>(cycleTime - s_lastCycleTime).count();
+    s_lastCycleTime = cycleTime;
+
+    ++g_pacingCycle;
+    g_pacingFrameState = state;
+    g_pacingCycleTime = cycleTime;
+    g_pacingCondition.notify_all();
+
+    // Wait for the game's frame for as long as the cycle can afford: its period
+    // less the time xrEndFrame takes and a margin. Not after an overrun, to
+    // catch up with the headset.
+    double periodMs = double(state.predictedDisplayPeriod) / 1.0e6;
+    bool overran = periodMs > 1.0 && lastCycleMs > periodMs * 1.25;
+
+    if (state.shouldRender == XR_TRUE && periodMs > 1.0 && !overran && g_publishSerial == s_consumedSerial)
+    {
+        auto deadline = cycleTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double, std::milli>(std::max(0.0, periodMs - g_pacingEndFrameMs - 1.0)));
+
+        g_pacingCondition.wait_until(lock, deadline, []()
+            {
+                return g_publishSerial != s_consumedSerial || !g_pacingRunning;
+            });
+    }
+
+    auto endStart = std::chrono::steady_clock::now();
+    s_statistics.contentWaitMs += std::chrono::duration<double, std::milli>(endStart - cycleTime).count();
+
+    bool fresh = g_publishSerial != s_consumedSerial;
+    s_consumedSerial = g_publishSerial;
+
+    // The swapchains may have been replaced or the session ended while waiting.
+    if (g_runtime == nullptr || !g_runtime->HasSession())
+        return;
+
+    result = EndPacedFrame(session, state, g_retainedLayer);
+    g_runtime->ObserveResult(result);
+
+    auto endTime = std::chrono::steady_clock::now();
+    double endFrameMs = std::chrono::duration<double, std::milli>(endTime - endStart).count();
+    g_pacingEndFrameMs += (std::min(endFrameMs, 6.0) - g_pacingEndFrameMs) * 0.1;
+
+    // Statistics, and the stalls the keep-alive used to report.
+    ++s_statistics.cycles;
+    s_statistics.endFrameMs += endFrameMs;
+    s_statistics.endFrameMaxMs = std::max(s_statistics.endFrameMaxMs, endFrameMs);
+
+    if (state.shouldRender != XR_TRUE || g_retainedLayer.mode == VRFrameMode::None)
+        ++s_statistics.emptyFrames;
+    else if (fresh)
+        ++s_statistics.freshFrames;
+    else
+        ++s_statistics.repeatedFrames;
+
+    bool stalled = !fresh && g_retainedLayer.mode != VRFrameMode::None && endTime - g_lastGameFrameTime >= STALL_TIME;
+    if (stalled && !s_repeating)
+    {
+        s_repeating = true;
+        g_keepAliveSince = endTime;
+        LOGN("[VR] The game stalled; the headset keeps its last picture.");
+    }
+    else if (fresh && s_repeating)
+    {
+        s_repeating = false;
+        LOGFN("[VR] The game is presenting again after {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(endTime - g_keepAliveSince).count());
+    }
+
+    if (endTime - s_statistics.since >= std::chrono::seconds(5))
+    {
+        double cycles = double(std::max(1u, s_statistics.cycles));
+
+        LOGFN("[VR] Last 5 s, pacing thread: {} headset frames: {} new from the game, {} repeated, {} without a picture. "
+            "Waited {:.2f} ms per frame for the game; xrEndFrame {:.2f} ms (max {:.2f}). The game's frames take {:.2f} ms.",
+            s_statistics.cycles, s_statistics.freshFrames, s_statistics.repeatedFrames, s_statistics.emptyFrames,
+            s_statistics.contentWaitMs / cycles, s_statistics.endFrameMs / cycles, s_statistics.endFrameMaxMs, g_gameFrameMs);
+
+        s_statistics = {};
+    }
+}
+
+static void StartPacing()
+{
+    g_lastGameFrameTime = std::chrono::steady_clock::now();
+    g_pacingRunning = true;
+    g_pacingThread = std::thread([]()
+        {
+            while (g_pacingRunning)
+                PaceFrame();
+        });
+}
+
+static void StopPacing()
+{
+    {
+        std::lock_guard lock(g_mutex);
+        g_pacingRunning = false;
+        g_pacingSessionRunning = false;
+    }
+
+    g_pacingCondition.notify_all();
+
+    if (g_pacingThread.joinable())
+        g_pacingThread.join();
+}
+
 static void StartKeepAlive()
 {
     g_lastGameFrameTime = std::chrono::steady_clock::now();
@@ -702,10 +1028,44 @@ bool VR::EndFrame(const VRFrameResult& result)
 
     g_lastGameFrameTime = std::chrono::steady_clock::now();
 
+    // With the pacing thread the frame is handed over rather than ended: the
+    // layer below, with the images just released, is what the thread's next
+    // xrEndFrame submits. Both happen under g_mutex, so the thread never
+    // submits these images with another frame's poses.
+    if (g_pacingEnabled)
+    {
+        double frameMs = std::chrono::duration<double, std::milli>(g_lastGameFrameTime - g_gameFrameBeginTime).count();
+        g_gameFrameMs += (std::clamp(frameMs, 0.0, 50.0) - g_gameFrameMs) * 0.2;
+    }
+
+    auto endFrame = [&](const RetainedLayer& layer)
+        {
+            g_retainedLayer = layer;
+
+            if (g_pacingEnabled)
+            {
+                ++g_publishSerial;
+                g_pacingCondition.notify_all();
+            }
+            else
+            {
+                EndFrameWithLayer(g_frame, layer);
+            }
+        };
+
     if (mode == VRFrameMode::None || !g_frame.should_render)
     {
-        auto queueLock = LockGraphicsQueue();
-        g_runtime->EndFrameWithoutLayers(g_frame);
+        if (g_pacingEnabled)
+        {
+            // The images released hold no picture: nothing to show until the next frame.
+            endFrame({});
+        }
+        else
+        {
+            auto queueLock = LockGraphicsQueue();
+            g_runtime->EndFrameWithoutLayers(g_frame);
+        }
+
         return true;
     }
 
@@ -731,8 +1091,7 @@ bool VR::EndFrame(const VRFrameResult& result)
             view.subImage.imageArrayIndex = 0;
         }
 
-        g_retainedLayer = layer;
-        EndFrameWithLayer(g_frame, layer);
+        endFrame(layer);
         return true;
     }
 
@@ -763,8 +1122,7 @@ bool VR::EndFrame(const VRFrameResult& result)
     quad.size.height = std::max(0.25f, Config::VRScreenWidth.Value) * 9.0f / 16.0f;
     quad.size.width = quad.size.height * std::clamp(result.screenAspectRatio, 0.25f, 4.0f);
 
-    g_retainedLayer = layer;
-    EndFrameWithLayer(g_frame, layer);
+    endFrame(layer);
     return true;
 }
 

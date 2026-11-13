@@ -67,6 +67,9 @@ struct VRFrameResult
 // presents (the main thread, or the loading thread while it owns presentation);
 // they are serialised internally. The render thread never calls OpenXR: it reads
 // the views with GetViews and renders into the images AcquireImages returned.
+// Unless [VR] VRPacingThread is off, the headset's own frame loop (xrWaitFrame,
+// xrBeginFrame, xrEndFrame) runs on a pacing thread at the headset's rate, and
+// the frame functions only hand it the game's frames (see xr.cpp).
 struct VR
 {
     // Set from --vr or [VR] VREnabled before the video device is created.
@@ -93,15 +96,16 @@ struct VR
     static void Shutdown();
 
     // Waits for the headset's next frame, begins it and locates the eyes. Does
-    // nothing when a frame is already begun or the session is not running.
+    // nothing when a frame is already begun or the session is not running. With
+    // the pacing thread it only waits when the game is ahead of the headset.
     static void BeginFrame();
 
     // Acquires the frame's images (all null when the headset shows nothing).
     static void AcquireImages(VRImages& images);
 
     // Releases the images and submits the frame as the render thread rendered
-    // it. True when a frame begun with xrWaitFrame was ended, so the headset
-    // paced this frame.
+    // it (or hands it to the pacing thread). True when a frame begun for the
+    // headset was ended, so the headset paced this frame.
     static bool EndFrame(const VRFrameResult& result);
 
     // The views located for the frame begun last. Any thread.
