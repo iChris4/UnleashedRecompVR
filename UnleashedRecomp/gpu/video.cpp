@@ -363,6 +363,7 @@ static Profiler g_renderDirectorProfiler;
 static Profiler g_frameFenceProfiler;
 static Profiler g_presentWaitProfiler;
 static Profiler g_swapChainAcquireProfiler;
+static Profiler g_executeWaitProfiler;
 
 static bool g_profilerVisible;
 static bool g_profilerWasToggled;
@@ -1433,14 +1434,28 @@ struct VRDrawStatistics
     uint32_t perEyeVertexConstants;
     uint32_t perEyePixelConstants;
 
-    // Timings of the headset frames: the render thread's time from the start of
-    // a frame to its output (waiting for the game's commands included), its
-    // time flushing state and issuing draws, the GPU's time on the frame's
-    // command list (the last one measured), and pipelines the render thread had
-    // to create itself.
+    // Timings of the headset frames. The game thread: the time between its
+    // presents, its update and render directors (the game's logic, and the
+    // game issuing its draws), and its waits for the headset (xrWaitFrame), for
+    // the render thread to submit the frame, and for the GPU to finish an older
+    // frame. The render thread: its time from the start of a frame to its output
+    // (waits for the game's commands included), its time processing commands,
+    // and of that its time flushing state and issuing draws. The GPU's time on
+    // the frame's command list (the last one measured), and pipelines the render
+    // thread had to create itself.
     uint32_t timedFrames;
+    double gameFrameMs;
+    double gameFrameMaxMs;
+    double gameUpdateMs;
+    double gameRenderMs;
+    double gameWorkMaxMs;
+    double headsetWaitMs;
+    double renderThreadWaitMs;
+    double gpuFenceWaitMs;
     double frameSpanMs;
     double frameSpanMaxMs;
+    double renderThreadBusyMs;
+    double renderThreadBusyMaxMs;
     double drawMs;
     double gpuFrameMs;
     double gpuFrameMaxMs;
@@ -1449,6 +1464,11 @@ struct VRDrawStatistics
 };
 
 static std::chrono::steady_clock::time_point g_vrFrameStartTime;
+
+// The render thread's time processing commands since the frame's output, and
+// the start of the batch of commands it is processing (see g_renderThread).
+static double g_renderThreadBusyMs;
+static std::chrono::steady_clock::time_point g_renderThreadBatchStart;
 
 // Adds the time a draw takes on the render thread to the statistics.
 struct VRDrawTimer
@@ -2686,10 +2706,16 @@ static void LogVRStatistics()
 
     if (s.timedFrames != 0)
     {
-        LOGFN("[VR] Last 5 s, timings per frame: render thread {:.2f} ms (max {:.2f}), of which draws {:.2f} ms; GPU {:.2f} ms (max {:.2f}). "
+        double n = double(s.timedFrames);
+
+        LOGFN("[VR] Last 5 s, timings per frame: game thread {:.2f} ms (max {:.2f}): update {:.2f} ms, render {:.2f} ms (max of both {:.2f}), "
+            "waits for the headset {:.2f} ms, for the render thread {:.2f} ms, for the GPU {:.2f} ms. "
+            "Render thread {:.2f} ms (max {:.2f}), busy {:.2f} ms (max {:.2f}), of which draws {:.2f} ms. GPU {:.2f} ms (max {:.2f}). "
             "Pipelines created on the render thread: {} ({:.1f} ms).",
-            s.frameSpanMs / s.timedFrames, s.frameSpanMaxMs, s.drawMs / s.timedFrames, s.gpuFrameMs / s.timedFrames, s.gpuFrameMaxMs,
-            s.renderThreadPipelines, s.renderThreadPipelineMs);
+            s.gameFrameMs / n, s.gameFrameMaxMs, s.gameUpdateMs / n, s.gameRenderMs / n, s.gameWorkMaxMs,
+            s.headsetWaitMs / n, s.renderThreadWaitMs / n, s.gpuFenceWaitMs / n,
+            s.frameSpanMs / n, s.frameSpanMaxMs, s.renderThreadBusyMs / n, s.renderThreadBusyMaxMs, s.drawMs / n,
+            s.gpuFrameMs / n, s.gpuFrameMaxMs, s.renderThreadPipelines, s.renderThreadPipelineMs);
     }
 
     if (g_vrSinglePass)
@@ -5242,7 +5268,9 @@ void Video::Present()
         g_shouldPrecompilePipelines = false;
     }
 
+    g_executeWaitProfiler.Begin();
     g_executedCommandList.wait(false);
+    g_executeWaitProfiler.End();
     g_executedCommandList = false;
 
     // The copy into the headset image has been submitted; hand it to the compositor.
@@ -5600,13 +5628,36 @@ static void ExecuteVROutput()
 
     ++(immersive ? g_vrStatistics.immersiveFrames : g_vrStatistics.flatFrames);
 
-    double frameSpanMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_vrFrameStartTime).count();
+    // Timings: the render thread's own, and the game thread's latest (written by
+    // that thread; its waits for the render thread and the GPU are the last
+    // frame's).
+    auto now = std::chrono::steady_clock::now();
+    double frameSpanMs = std::chrono::duration<double, std::milli>(now - g_vrFrameStartTime).count();
+    double busyMs = g_renderThreadBusyMs + std::chrono::duration<double, std::milli>(now - g_renderThreadBatchStart).count();
+    g_renderThreadBusyMs = 0.0;
+    g_renderThreadBatchStart = now;
+
+    double gameFrameMs = g_presentProfiler.value;
+    double gameUpdateMs = g_updateDirectorProfiler.value;
+    double gameRenderMs = g_renderDirectorProfiler.value;
     double gpuFrameMs = g_gpuFrameProfiler.value;
-    ++g_vrStatistics.timedFrames;
-    g_vrStatistics.frameSpanMs += frameSpanMs;
-    g_vrStatistics.frameSpanMaxMs = std::max(g_vrStatistics.frameSpanMaxMs, frameSpanMs);
-    g_vrStatistics.gpuFrameMs += gpuFrameMs;
-    g_vrStatistics.gpuFrameMaxMs = std::max(g_vrStatistics.gpuFrameMaxMs, gpuFrameMs);
+
+    VRDrawStatistics& t = g_vrStatistics;
+    ++t.timedFrames;
+    t.gameFrameMs += gameFrameMs;
+    t.gameFrameMaxMs = std::max(t.gameFrameMaxMs, gameFrameMs);
+    t.gameUpdateMs += gameUpdateMs;
+    t.gameRenderMs += gameRenderMs;
+    t.gameWorkMaxMs = std::max(t.gameWorkMaxMs, gameUpdateMs + gameRenderMs);
+    t.headsetWaitMs += g_presentWaitProfiler.value;
+    t.renderThreadWaitMs += g_executeWaitProfiler.value;
+    t.gpuFenceWaitMs += g_frameFenceProfiler.value;
+    t.frameSpanMs += frameSpanMs;
+    t.frameSpanMaxMs = std::max(t.frameSpanMaxMs, frameSpanMs);
+    t.renderThreadBusyMs += busyMs;
+    t.renderThreadBusyMaxMs = std::max(t.renderThreadBusyMaxMs, busyMs);
+    t.gpuFrameMs += gpuFrameMs;
+    t.gpuFrameMaxMs = std::max(t.gpuFrameMaxMs, gpuFrameMs);
 
     LogVRStatistics();
 
@@ -8532,9 +8583,12 @@ static std::thread g_renderThread([]
         while (true)
         {
             size_t count = g_renderQueue.wait_dequeue_bulk(commands, std::size(commands));
+            g_renderThreadBatchStart = std::chrono::steady_clock::now();
 
             for (size_t i = 0; i < count; i++)
                 ProcessRenderCommand(commands[i]);
+
+            g_renderThreadBusyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_renderThreadBatchStart).count();
         }
     });
 
