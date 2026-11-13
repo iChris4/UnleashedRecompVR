@@ -10,6 +10,7 @@
 
 #include <vr/openxr_runtime.h>
 #include <os/logger.h>
+#include <user/config.h>
 
 #include <algorithm>
 #include <sstream>
@@ -97,6 +98,10 @@ bool XrVulkan::Prepare(PortVr::OpenXRRuntime& runtime)
 
     plume::VulkanAdditionalInstanceExtensions = std::move(instanceExtensions);
     plume::VulkanAdditionalDeviceExtensions = std::move(deviceExtensions);
+
+    // Foveated rendering ([VR] VRFoveation) needs a shading rate attachment in
+    // every render pass, which the device must be created for.
+    plume::VulkanShadingRateAttachments = Config::VRFoveation > 0;
     return true;
 }
 

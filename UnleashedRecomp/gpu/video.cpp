@@ -1571,25 +1571,50 @@ static std::unique_ptr<RenderPipeline> g_vrMaskPipelines[4][2];
 
 // Fixed foveated rendering ([VR] VRFoveation: 0 off, 1 low, 2 medium, 3 high):
 // draws into the scene's targets are shaded at 2x2 or 4x4 pixels per pixel
-// shader invocation away from the eyes' lens centres, from shading rate images
-// of a texel per screen tile. There is one per eye, for frame replay, which
-// draws one eye at a time, and one for both, for single-pass stereo (one image
-// serves both layers): the finer rate of the two eyes per tile. The HUD, menus,
-// copies and the headset output keep the full rate, and so do frames shown on
-// the floating screen. Needs variable rate shading tier 2 (D3D12 for now).
+// shader invocation away from the lens centre of the eye they are for, from
+// shading rate images of a texel per screen tile holding each eye's pattern.
+// The HUD, menus, copies and the headset output keep the full rate, and so do
+// frames shown on the floating screen.
+//
+// D3D12 (variable rate shading tier 2): an image per eye for frame replay, which
+// draws one eye at a time (images 0 and 1), and for single-pass stereo an image
+// with a layer per eye (image 2).
+//
+// Vulkan (VK_KHR_fragment_shading_rate): the image is an attachment of every
+// framebuffer, so there is one for the device, g_vrShadingRateAttachment,
+// updated in place and only used by the draws that enable it. In single-pass
+// stereo it has a layer per eye; frame replay writes the eye's pattern into its
+// first layer before each eye's pass. Where the device reads one layer for all
+// the target's (g_vrShadingRateAttachmentLayers 1), single-pass stereo uses the
+// finer rate of the two eyes per tile (pattern 2).
 struct VRFoveation
 {
+    bool built = false;
     std::unique_ptr<RenderTexture> images[3];
+
+    // The eyes' patterns and the one both share, a byte per tile.
+    std::vector<uint8_t> patterns[3];
+    uint32_t tilesX = 0;
+    uint32_t tilesY = 0;
     uint32_t sceneWidth = 0;
     uint32_t sceneHeight = 0;
     int32_t level = 0;
     float terms[2][4]{};
 
-    // The tiles at each rate (1x1, 2x2, 4x4), in the image both eyes share.
+    // The tiles at each rate (1x1, 2x2, 4x4), in the left eye's pattern.
     uint32_t tileCounts[3]{};
 };
 
 static VRFoveation g_vrFoveation;
+
+// Vulkan: the device's shading rate attachment (see VRFoveation), a square of
+// this many tiles, zeroed (the full rate) at the first frame.
+static std::unique_ptr<RenderTexture> g_vrShadingRateAttachment;
+static uint32_t g_vrShadingRateAttachmentSize;
+static uint32_t g_vrShadingRateAttachmentLayers = 1;
+static bool g_vrShadingRateAttachmentReady;
+
+static void UploadVRFoveationPattern(RenderTexture* texture, uint32_t layer, uint32_t pattern);
 static std::vector<std::unique_ptr<RenderTexture>> g_vrRetiredFoveationImages[NUM_FRAMES];
 static bool g_vrFoveationFrame;
 static bool g_vrEyesValid;
@@ -1831,8 +1856,12 @@ static void BeginVRFrame()
     g_vrHiddenAreaFrame = Config::VRHiddenAreaMask && g_vrLastFrameImmersive && !vrCutscene && (performanceTest != 1 || testOn);
 
     UpdateVRFoveation();
-    g_vrFoveationFrame = g_vrFoveation.images[2] != nullptr && Config::VRFoveation > 0 && g_vrLastFrameImmersive && !vrCutscene &&
+    g_vrFoveationFrame = g_vrFoveation.built && Config::VRFoveation > 0 && g_vrLastFrameImmersive && !vrCutscene &&
         (performanceTest != 2 || testOn);
+
+    // Vulkan, frame replay: the left eye's pattern for its pass (see VRFoveation).
+    if (g_vrFoveationFrame && g_capabilities.shadingRateAttachment && !g_vrSinglePass)
+        UploadVRFoveationPattern(g_vrShadingRateAttachment.get(), 0, 0);
 
     if (g_vrHiddenAreaFrame)
     {
@@ -1897,6 +1926,10 @@ static void RestoreVRFrameStart(GuestSurface* backBuffer)
 
     // The output pass and ImGui bound their own layouts and descriptors.
     FlushBarriers();
+
+    // Vulkan: the right eye's foveation pattern for its pass (see VRFoveation).
+    if (g_vrFoveationFrame && g_capabilities.shadingRateAttachment)
+        UploadVRFoveationPattern(g_vrShadingRateAttachment.get(), 0, 1);
 
     auto& commandList = g_commandLists[g_frame];
     commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
@@ -2877,7 +2910,7 @@ static void LogVRStatistics()
         const VRFoveation& f = g_vrFoveation;
         uint32_t tiles = std::max(1u, f.tileCounts[0] + f.tileCounts[1] + f.tileCounts[2]);
 
-        LOGFN("[VR] Last 5 s, foveated rendering (level {}): {} draws; the image both eyes share is {:.0f}% at full rate, "
+        LOGFN("[VR] Last 5 s, foveated rendering (level {}): {} draws; each eye's image is {:.0f}% at full rate, "
             "{:.0f}% at 2x2 and {:.0f}% at 4x4 pixels per shading.",
             f.level, s.foveatedDraws, 100.0 * f.tileCounts[0] / tiles, 100.0 * f.tileCounts[1] / tiles, 100.0 * f.tileCounts[2] / tiles);
     }
@@ -4119,6 +4152,29 @@ static void BeginCommandList()
     g_gpuSegmentKind = -1;
     g_boundShadingRateImage = nullptr;
 
+    // Vulkan: the shading rate attachment starts at the full rate everywhere,
+    // in the layout the render passes expect it in.
+    if (g_vrShadingRateAttachment != nullptr && !g_vrShadingRateAttachmentReady)
+    {
+        uint32_t size = g_vrShadingRateAttachmentSize;
+        uint32_t pitch = (size + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+        auto allocation = g_uploadAllocators[g_frame].allocate(pitch * size, PLACEMENT_ALIGNMENT);
+        memset(allocation.memory, 0, pitch * size);
+
+        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(g_vrShadingRateAttachment.get(), RenderTextureLayout::COPY_DEST));
+
+        for (uint32_t layer = 0; layer < g_vrShadingRateAttachmentLayers; layer++)
+        {
+            commandList->copyTextureRegion(
+                RenderTextureCopyLocation::Subresource(g_vrShadingRateAttachment.get(), 0, layer),
+                RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, RenderFormat::R8_UINT, size, size, 1, pitch, allocation.offset));
+        }
+
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g_vrShadingRateAttachment.get(), RenderTextureLayout::SHADING_RATE_SOURCE));
+
+        g_vrShadingRateAttachmentReady = true;
+    }
+
     if (VR::IsActive())
     {
         commandList->resetQueryPool(g_segmentQueryPools[g_frame].get(), 0, NUM_SEGMENT_QUERIES);
@@ -4338,6 +4394,22 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 #endif
 
     g_capabilities = g_device->getCapabilities();
+
+    // VR on Vulkan: the shading rate attachment every framebuffer takes (see VRFoveation).
+    if (g_capabilities.shadingRateAttachment && g_capabilities.shadingRateImageTileSize != 0)
+    {
+        uint32_t tileSize = g_capabilities.shadingRateImageTileSize;
+        g_vrShadingRateAttachmentSize = (uint32_t(std::min<uint64_t>(g_capabilities.maxTextureSize, 16384)) + tileSize - 1) / tileSize;
+
+        g_vrShadingRateAttachmentLayers = g_capabilities.shadingRateImageLayers ? 2 : 1;
+
+        RenderTextureDesc attachmentDesc = RenderTextureDesc::Texture2D(
+            g_vrShadingRateAttachmentSize, g_vrShadingRateAttachmentSize, 1, RenderFormat::R8_UINT, RenderTextureFlag::SHADING_RATE);
+        attachmentDesc.arraySize = g_vrShadingRateAttachmentLayers;
+        g_vrShadingRateAttachment = g_device->createTexture(attachmentDesc);
+
+        g_device->setShadingRateAttachment(g_vrShadingRateAttachment.get());
+    }
 
     LoadEmbeddedResources();
 
@@ -6838,7 +6910,7 @@ static void UpdateVRFoveation()
     if (sceneWidth <= 0 || sceneHeight <= 0)
         return;
 
-    bool rebuild = f.images[0] == nullptr || f.level != level || f.sceneWidth != uint32_t(sceneWidth) || f.sceneHeight != uint32_t(sceneHeight);
+    bool rebuild = !f.built || f.level != level || f.sceneWidth != uint32_t(sceneWidth) || f.sceneHeight != uint32_t(sceneHeight);
     for (uint32_t eye = 0; eye < 2 && !rebuild; eye++)
     {
         for (uint32_t i = 0; i < 4; i++)
@@ -6865,7 +6937,7 @@ static void UpdateVRFoveation()
     static constexpr float FullRateAngles[] = { 0.0f, 35.0f, 27.0f, 20.0f };
     static constexpr float HalfRateAngles[] = { 0.0f, 90.0f, 40.0f, 32.0f };
 
-    // D3D12_SHADING_RATE values.
+    // D3D12_SHADING_RATE values (Vulkan's attachment texels encode sizes alike).
     constexpr uint8_t Rate1x1 = 0x0;
     constexpr uint8_t Rate2x2 = 0x5;
     constexpr uint8_t Rate4x4 = 0xA;
@@ -6874,60 +6946,115 @@ static void UpdateVRFoveation()
     uint32_t tileSize = g_capabilities.shadingRateImageTileSize;
     uint32_t tilesX = (f.sceneWidth + tileSize - 1) / tileSize;
     uint32_t tilesY = (f.sceneHeight + tileSize - 1) / tileSize;
-    uint32_t pitch = (tilesX + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+
+    bool attachment = g_capabilities.shadingRateAttachment;
+    if (attachment && (g_vrShadingRateAttachment == nullptr || !g_vrShadingRateAttachmentReady ||
+        tilesX > g_vrShadingRateAttachmentSize || tilesY > g_vrShadingRateAttachmentSize))
+    {
+        f.built = false;
+        return;
+    }
+
+    f.built = true;
+    f.tilesX = tilesX;
+    f.tilesY = tilesY;
 
     float fullRateTangent = tanf(FullRateAngles[level] * 3.14159265f / 180.0f);
     float halfRateTangent = tanf(std::min(HalfRateAngles[level], 89.0f) * 3.14159265f / 180.0f);
 
-    auto& commandList = g_commandLists[g_frame];
+    for (auto& pattern : f.patterns)
+        pattern.assign(size_t(tilesX) * tilesY, Rate1x1);
+
     memset(f.tileCounts, 0, sizeof(f.tileCounts));
 
-    for (uint32_t image = 0; image < 3; image++)
+    for (uint32_t y = 0; y < tilesY; y++)
     {
-        auto allocation = g_uploadAllocators[g_frame].allocate(pitch * tilesY, PLACEMENT_ALIGNMENT);
-
-        for (uint32_t y = 0; y < tilesY; y++)
+        for (uint32_t x = 0; x < tilesX; x++)
         {
-            for (uint32_t x = 0; x < tilesX; x++)
+            // The tile's centre in normalised device coordinates.
+            float ndcX = (std::min(float(x * tileSize) + 0.5f * tileSize, float(f.sceneWidth)) / float(f.sceneWidth)) * 2.0f - 1.0f;
+            float ndcY = 1.0f - (std::min(float(y * tileSize) + 0.5f * tileSize, float(f.sceneHeight)) / float(f.sceneHeight)) * 2.0f;
+
+            uint32_t rateIndices[2];
+            for (uint32_t eye = 0; eye < 2; eye++)
             {
-                // The tile's centre in normalised device coordinates.
-                float ndcX = (std::min(float(x * tileSize) + 0.5f * tileSize, float(f.sceneWidth)) / float(f.sceneWidth)) * 2.0f - 1.0f;
-                float ndcY = 1.0f - (std::min(float(y * tileSize) + 0.5f * tileSize, float(f.sceneHeight)) / float(f.sceneHeight)) * 2.0f;
+                // The tangent of the angle off the eye's lens axis.
+                const float* terms = f.terms[eye];
+                float tangentX = (ndcX + terms[2]) / terms[0];
+                float tangentY = (ndcY + terms[3]) / terms[1];
+                float tangent = sqrtf(tangentX * tangentX + tangentY * tangentY);
 
-                // The finer rate of the eyes the image is for.
-                uint32_t rateIndex = 2;
-                for (uint32_t eye = 0; eye < 2; eye++)
-                {
-                    if (image < 2 && eye != image)
-                        continue;
-
-                    const float* terms = f.terms[eye];
-                    float tangentX = (ndcX + terms[2]) / terms[0];
-                    float tangentY = (ndcY + terms[3]) / terms[1];
-                    float tangent = sqrtf(tangentX * tangentX + tangentY * tangentY);
-
-                    uint32_t eyeRateIndex = tangent <= fullRateTangent ? 0 : (tangent <= halfRateTangent ? 1 : 2);
-                    rateIndex = std::min(rateIndex, eyeRateIndex);
-                }
-
-                allocation.memory[y * pitch + x] = rates[rateIndex];
-
-                if (image == 2)
-                    ++f.tileCounts[rates[rateIndex] == Rate1x1 ? 0 : (rates[rateIndex] == Rate2x2 ? 1 : 2)];
+                rateIndices[eye] = tangent <= fullRateTangent ? 0 : (tangent <= halfRateTangent ? 1 : 2);
+                f.patterns[eye][size_t(y) * tilesX + x] = rates[rateIndices[eye]];
             }
+
+            f.patterns[2][size_t(y) * tilesX + x] = rates[std::min(rateIndices[0], rateIndices[1])];
+            ++f.tileCounts[rates[rateIndices[0]] == Rate1x1 ? 0 : (rates[rateIndices[0]] == Rate2x2 ? 1 : 2)];
         }
-
-        f.images[image] = g_device->createTexture(RenderTextureDesc::Texture2D(tilesX, tilesY, 1, RenderFormat::R8_UINT, RenderTextureFlag::NONE));
-
-        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(f.images[image].get(), RenderTextureLayout::COPY_DEST));
-        commandList->copyTextureRegion(
-            RenderTextureCopyLocation::Subresource(f.images[image].get(), 0),
-            RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, RenderFormat::R8_UINT, tilesX, tilesY, 1, pitch, allocation.offset));
-        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(f.images[image].get(), RenderTextureLayout::SHADING_RATE_SOURCE));
     }
 
-    LOGFN("[VR] Foveated rendering (level {}): {}x{} tiles of {} pixels; the image both eyes share is {:.0f}% at full rate.",
-        level, tilesX, tilesY, tileSize, 100.0 * f.tileCounts[0] / std::max(1u, tilesX * tilesY));
+    if (attachment)
+    {
+        // Single-pass stereo: a layer per eye, or the shared pattern in the only
+        // one. Frame replay: BeginVRFrame and RestoreVRFrameStart write the eye's.
+        if (g_vrSinglePass)
+        {
+            if (g_vrShadingRateAttachmentLayers >= 2)
+            {
+                UploadVRFoveationPattern(g_vrShadingRateAttachment.get(), 0, 0);
+                UploadVRFoveationPattern(g_vrShadingRateAttachment.get(), 1, 1);
+            }
+            else
+            {
+                UploadVRFoveationPattern(g_vrShadingRateAttachment.get(), 0, 2);
+            }
+        }
+    }
+    else if (g_vrSinglePass)
+    {
+        // A layer per eye, or the shared pattern where one layer serves both.
+        bool layered = g_capabilities.shadingRateImageLayers;
+        RenderTextureDesc desc = RenderTextureDesc::Texture2D(tilesX, tilesY, 1, RenderFormat::R8_UINT, RenderTextureFlag::NONE);
+        desc.arraySize = layered ? 2 : 1;
+        f.images[2] = g_device->createTexture(desc);
+
+        for (uint32_t layer = 0; layer < desc.arraySize; layer++)
+            UploadVRFoveationPattern(f.images[2].get(), layer, layered ? layer : 2);
+    }
+    else
+    {
+        for (uint32_t eye = 0; eye < 2; eye++)
+        {
+            f.images[eye] = g_device->createTexture(RenderTextureDesc::Texture2D(tilesX, tilesY, 1, RenderFormat::R8_UINT, RenderTextureFlag::NONE));
+            UploadVRFoveationPattern(f.images[eye].get(), 0, eye);
+        }
+    }
+
+    LOGFN("[VR] Foveated rendering (level {}): {}x{} tiles of {} pixels; each eye's image is {:.0f}% at full rate{}.",
+        level, tilesX, tilesY, tileSize, 100.0 * f.tileCounts[0] / std::max(1u, tilesX * tilesY),
+        (g_vrSinglePass && !g_capabilities.shadingRateImageLayers) ? " (one image for both eyes: the finer rate of the two)" : "");
+}
+
+// Copies a foveation pattern (an eye's, or 2 for the shared one) into a layer of
+// a shading rate image, in the corner the scene's targets cover.
+static void UploadVRFoveationPattern(RenderTexture* texture, uint32_t layer, uint32_t pattern)
+{
+    const VRFoveation& f = g_vrFoveation;
+    if (texture == nullptr || f.tilesX == 0 || f.tilesY == 0 || f.patterns[pattern].size() != size_t(f.tilesX) * f.tilesY)
+        return;
+
+    uint32_t pitch = (f.tilesX + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+    auto allocation = g_uploadAllocators[g_frame].allocate(pitch * f.tilesY, PLACEMENT_ALIGNMENT);
+
+    for (uint32_t y = 0; y < f.tilesY; y++)
+        memcpy(allocation.memory + size_t(y) * pitch, f.patterns[pattern].data() + size_t(y) * f.tilesX, f.tilesX);
+
+    auto& commandList = g_commandLists[g_frame];
+    commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture, RenderTextureLayout::COPY_DEST));
+    commandList->copyTextureRegion(
+        RenderTextureCopyLocation::Subresource(texture, 0, layer),
+        RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, RenderFormat::R8_UINT, f.tilesX, f.tilesY, 1, pitch, allocation.offset));
+    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture, RenderTextureLayout::SHADING_RATE_SOURCE));
 }
 
 // VR: draws the hidden area mask (see g_vrHiddenAreaFrame) into the depth buffer
@@ -8123,7 +8250,8 @@ static void FlushRenderStateForRenderThread()
             std::abs(int32_t(target->width) - int32_t(g_vrFoveation.sceneWidth)) <= 2 &&
             std::abs(int32_t(target->height) - int32_t(g_vrFoveation.sceneHeight)) <= 2)
         {
-            shadingRateImage = g_vrFoveation.images[g_vrSinglePass ? 2 : g_vrPass].get();
+            shadingRateImage = g_capabilities.shadingRateAttachment ? g_vrShadingRateAttachment.get() :
+                g_vrFoveation.images[g_vrSinglePass ? 2 : g_vrPass].get();
             ++g_vrStatistics.foveatedDraws;
         }
     }
