@@ -100,6 +100,8 @@
 #include "shader/xr_ui_ps.hlsl.stereo.dxil.h"
 #include "shader/xr_ui_vs.hlsl.dxil.h"
 #include "shader/xr_ui_vs.hlsl.stereo.dxil.h"
+#include "shader/xr_mask_vs.hlsl.dxil.h"
+#include "shader/xr_mask_vs.hlsl.stereo.dxil.h"
 #endif
 
 #include "shader/blend_color_alpha_ps.hlsl.spirv.h"
@@ -156,6 +158,8 @@
 #include "shader/xr_ui_ps.hlsl.stereo.spirv.h"
 #include "shader/xr_ui_vs.hlsl.spirv.h"
 #include "shader/xr_ui_vs.hlsl.stereo.spirv.h"
+#include "shader/xr_mask_vs.hlsl.spirv.h"
+#include "shader/xr_mask_vs.hlsl.stereo.spirv.h"
 
 #ifdef _WIN32
 extern "C"
@@ -394,6 +398,43 @@ static std::unique_ptr<RenderCommandQueue> g_queue;
 static std::unique_ptr<RenderCommandList> g_commandLists[NUM_FRAMES];
 static std::unique_ptr<RenderCommandFence> g_commandFences[NUM_FRAMES];
 static std::unique_ptr<RenderQueryPool> g_queryPools[NUM_FRAMES];
+
+// VR: where the GPU's time goes in a headset frame. The render thread writes a
+// timestamp whenever the kind of work changes (a segment); the game thread
+// reads them back with the frame's own and adds the times up by kind, for the
+// VR log. A frame with more changes than queries leaves the rest to its last
+// segment.
+enum GpuSegmentKind : uint8_t
+{
+    // Square targets: the shadow maps (and the small luminance chain).
+    GPU_SEGMENT_SHADOWS,
+
+    // Draws with a depth test: the world.
+    GPU_SEGMENT_SCENE,
+
+    // Draws without one: post-processing, 2D, and the copies between them.
+    GPU_SEGMENT_FLAT,
+
+    // The headset's images and the window.
+    GPU_SEGMENT_OUTPUT,
+
+    GPU_SEGMENT_KIND_COUNT
+};
+
+static constexpr uint32_t NUM_SEGMENT_QUERIES = 128;
+static constexpr uint32_t GPU_SEGMENTS_UNUSED = UINT32_MAX;
+
+static std::unique_ptr<RenderQueryPool> g_segmentQueryPools[NUM_FRAMES];
+static uint8_t g_gpuSegmentKinds[NUM_FRAMES][NUM_SEGMENT_QUERIES];
+static uint32_t g_gpuSegmentCounts[NUM_FRAMES] = { GPU_SEGMENTS_UNUSED, GPU_SEGMENTS_UNUSED };
+static int32_t g_gpuSegmentKind = -1;
+
+static std::mutex g_gpuSegmentMutex;
+static double g_gpuSegmentMs[GPU_SEGMENT_KIND_COUNT];
+static uint32_t g_gpuSegmentFrames;
+static uint64_t g_gpuSegmentTotal;
+
+static void BeginGpuSegment(GpuSegmentKind kind);
 static bool g_commandListStates[NUM_FRAMES];
 
 static Mutex g_copyMutex;
@@ -1465,6 +1506,12 @@ struct VRDrawStatistics
     // and of that its time flushing state and issuing draws. The GPU's time on
     // the frame's command list (the last one measured), and pipelines the render
     // thread had to create itself.
+    // Hidden area mask draws, the triangles of the last one and the share of
+    // the image they cover.
+    uint32_t hiddenAreaDraws;
+    uint32_t hiddenAreaTriangles;
+    float hiddenAreaShare;
+
     uint32_t timedFrames;
     double constantUploadMs;
     double gameFrameMs;
@@ -1487,6 +1534,18 @@ struct VRDrawStatistics
 };
 
 static std::chrono::steady_clock::time_point g_vrFrameStartTime;
+
+// The hidden area mask ([VR] VRHiddenAreaMask): the part of each eye's image the
+// lens hides (VR::GetHiddenAreaMesh) is drawn at the nearest depth into the
+// scene's depth buffers right after the game clears them, so nothing is shaded
+// there. Only in frames following a stereo frame, and not in cutscenes shown on
+// the floating screen, whose picture is seen whole.
+static std::vector<float> g_vrHiddenAreaMeshes[2];
+static uint32_t g_vrHiddenAreaSerials[2];
+static bool g_vrHiddenAreaFrame;
+static bool g_vrLastFrameImmersive;
+static std::unique_ptr<RenderShader> g_vrMaskShader;
+static std::unique_ptr<RenderPipeline> g_vrMaskPipelines[4];
 
 // The render thread's time processing commands since the frame's output, and
 // the start of the batch of commands it is processing (see g_renderThread).
@@ -1706,10 +1765,20 @@ static void BeginVRFrame()
     // Cutscenes go on the floating screen as the game frames them ([VR]
     // VRCutsceneScreen): their cuts and camera moves are hard to watch around
     // the head. With no views latched, nothing is drawn per eye.
-    if (Config::VRCutsceneScreen && InspirePatches::s_sceneActive)
+    bool vrCutscene = Config::VRCutsceneScreen && InspirePatches::s_sceneActive;
+
+    if (vrCutscene)
     {
         g_vrViewsLatched = true;
         ++g_vrStatistics.cutsceneFrames;
+    }
+
+    g_vrHiddenAreaFrame = Config::VRHiddenAreaMask && g_vrLastFrameImmersive && !vrCutscene;
+
+    if (g_vrHiddenAreaFrame)
+    {
+        for (uint32_t eye = 0; eye < 2; eye++)
+            VR::GetHiddenAreaMesh(eye, g_vrHiddenAreaMeshes[eye], g_vrHiddenAreaSerials[eye]);
     }
 
     // Single-pass stereo replays nothing.
@@ -2740,6 +2809,37 @@ static void LogVRStatistics()
             s.headsetWaitMs / n, s.renderThreadWaitMs / n, s.gpuFenceWaitMs / n,
             s.frameSpanMs / n, s.frameSpanMaxMs, s.renderThreadBusyMs / n, s.renderThreadBusyMaxMs, s.drawMs / n, s.constantUploadMs / n,
             s.gpuFrameMs / n, s.gpuFrameMaxMs, s.renderThreadPipelines, s.renderThreadPipelineMs);
+    }
+
+    if (s.hiddenAreaDraws != 0)
+    {
+        LOGFN("[VR] Last 5 s, hidden area mask: {} draws of {} triangles covering {:.1f}% of the image.",
+            s.hiddenAreaDraws, s.hiddenAreaTriangles, s.hiddenAreaShare * 100.0f);
+    }
+
+    {
+        double segmentMs[GPU_SEGMENT_KIND_COUNT];
+        uint32_t segmentFrames;
+        uint64_t segmentTotal;
+        {
+            std::lock_guard lock(g_gpuSegmentMutex);
+            memcpy(segmentMs, g_gpuSegmentMs, sizeof(segmentMs));
+            segmentFrames = g_gpuSegmentFrames;
+            segmentTotal = g_gpuSegmentTotal;
+            memset(g_gpuSegmentMs, 0, sizeof(g_gpuSegmentMs));
+            g_gpuSegmentFrames = 0;
+            g_gpuSegmentTotal = 0;
+        }
+
+        if (segmentFrames != 0)
+        {
+            double n = double(segmentFrames);
+
+            LOGFN("[VR] Last 5 s, GPU time per frame: shadow maps {:.2f} ms, world (draws with a depth test) {:.2f} ms, "
+                "post-processing and 2D (draws without one) {:.2f} ms, headset output {:.2f} ms ({:.0f} segments per frame of {}).",
+                segmentMs[GPU_SEGMENT_SHADOWS] / n, segmentMs[GPU_SEGMENT_SCENE] / n, segmentMs[GPU_SEGMENT_FLAT] / n,
+                segmentMs[GPU_SEGMENT_OUTPUT] / n, double(segmentTotal) / n, NUM_SEGMENT_QUERIES);
+        }
     }
 
     if (g_vrSinglePass)
@@ -3920,6 +4020,19 @@ static void BeginCommandList()
     commandList->begin();
     commandList->resetQueryPool(g_queryPools[g_frame].get(), 0, NUM_QUERIES);
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 0);
+
+    // VR: the frame's GPU segments (see GpuSegmentKind).
+    g_gpuSegmentKind = -1;
+
+    if (VR::IsActive())
+    {
+        commandList->resetQueryPool(g_segmentQueryPools[g_frame].get(), 0, NUM_SEGMENT_QUERIES);
+        g_gpuSegmentCounts[g_frame] = 0;
+    }
+    else
+    {
+        g_gpuSegmentCounts[g_frame] = GPU_SEGMENTS_UNUSED;
+    }
     commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
@@ -4170,6 +4283,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     for (auto& queryPool : g_queryPools)
         queryPool = g_device->createQueryPool(NUM_QUERIES);
+
+    for (auto& queryPool : g_segmentQueryPools)
+        queryPool = g_device->createQueryPool(NUM_SEGMENT_QUERIES);
 
     g_copyQueue = g_device->createCommandQueue(RenderCommandListType::COPY);
     g_copyCommandList = g_copyQueue->createCommandList();
@@ -5378,6 +5494,41 @@ void Video::Present()
         g_queryPools[g_frame]->queryResults();
         const uint64_t *frameTimestamps = g_queryPools[g_frame]->getResults();
         g_gpuFrameProfiler.Set(double(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0);
+
+        // VR: the frame's GPU segments, each lasting until the next one or the
+        // frame's end; the time before the first one counts as flat work.
+        uint32_t segmentCount = g_gpuSegmentCounts[g_frame];
+        if (segmentCount != GPU_SEGMENTS_UNUSED && segmentCount != 0 && segmentCount <= NUM_SEGMENT_QUERIES)
+        {
+            g_segmentQueryPools[g_frame]->queryResults();
+            const uint64_t* segmentTimestamps = g_segmentQueryPools[g_frame]->getResults();
+            double segmentMs[GPU_SEGMENT_KIND_COUNT] = {};
+            bool valid = segmentTimestamps[0] >= frameTimestamps[0];
+
+            if (valid)
+                segmentMs[GPU_SEGMENT_FLAT] += double(segmentTimestamps[0] - frameTimestamps[0]) / 1000000.0;
+
+            for (uint32_t i = 0; i < segmentCount && valid; i++)
+            {
+                uint64_t start = segmentTimestamps[i];
+                uint64_t end = (i + 1 < segmentCount) ? segmentTimestamps[i + 1] : frameTimestamps[1];
+                valid = end >= start && (end - start) < 1000000000ull;
+
+                if (valid)
+                    segmentMs[g_gpuSegmentKinds[g_frame][i]] += double(end - start) / 1000000.0;
+            }
+
+            if (valid)
+            {
+                std::lock_guard lock(g_gpuSegmentMutex);
+
+                for (size_t i = 0; i < GPU_SEGMENT_KIND_COUNT; i++)
+                    g_gpuSegmentMs[i] += segmentMs[i];
+
+                ++g_gpuSegmentFrames;
+                g_gpuSegmentTotal += segmentCount;
+            }
+        }
     }
 
     // VR: a new headset resolution replaces the headset's images once the GPU
@@ -5652,6 +5803,7 @@ static void ProcessRenderCommand(const RenderCommand& cmd);
 static void ExecuteVROutput()
 {
     g_vrRecording = false;
+    BeginGpuSegment(GPU_SEGMENT_OUTPUT);
 
     bool immersive = g_vrPass == 0 && g_vrViews.valid && g_vrCameraDrawCount > 0 &&
         g_vrImages.eyes[0] != nullptr && g_vrImages.eyes[1] != nullptr;
@@ -5695,6 +5847,7 @@ static void ExecuteVROutput()
     }
 
     ++(immersive ? g_vrStatistics.immersiveFrames : g_vrStatistics.flatFrames);
+    g_vrLastFrameImmersive = immersive;
 
     // Timings: the render thread's own, and the game thread's latest (written by
     // that thread; its waits for the render thread and the GPU are the last
@@ -5790,6 +5943,14 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
 
     auto &commandList = g_commandLists[g_frame];
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
+
+    // Vulkan reads the pool back whole: every query must have been written.
+    if (g_vulkan && g_gpuSegmentCounts[g_frame] != GPU_SEGMENTS_UNUSED)
+    {
+        for (uint32_t i = g_gpuSegmentCounts[g_frame]; i < NUM_SEGMENT_QUERIES; i++)
+            commandList->writeTimestamp(g_segmentQueryPools[g_frame].get(), i);
+    }
+
     commandList->end();
 
     if (g_swapChainValid)
@@ -6549,6 +6710,138 @@ static void Clear(GuestDevice* device, uint32_t flags, uint32_t, be<float>* colo
     g_renderQueue.enqueue(cmd);
 }
 
+// VR: draws the hidden area mask (see g_vrHiddenAreaFrame) into the depth buffer
+// just cleared to `clearZ`, at the opposite end of the depth range, for the eye
+// being drawn or in single-pass stereo for each eye's layer.
+static void DrawVRHiddenAreaMask(float clearZ)
+{
+    GuestSurface* depthStencil = g_depthStencil;
+
+    int32_t sceneWidth, sceneHeight;
+    GetVRSceneSize(sceneWidth, sceneHeight);
+
+    // The scene's own depth buffers: of its size, and drawn through the game camera before.
+    if (g_vrPass < 0 || !g_vrHiddenAreaFrame || depthStencil == nullptr || !depthStencil->vrPerspectiveDepth ||
+        std::abs(int32_t(depthStencil->width) - sceneWidth) > 2 || std::abs(int32_t(depthStencil->height) - sceneHeight) > 2)
+    {
+        return;
+    }
+
+    uint32_t pipelineIndex;
+    switch (depthStencil->sampleCount)
+    {
+    case RenderSampleCount::COUNT_1:
+        pipelineIndex = 0;
+        break;
+    case RenderSampleCount::COUNT_2:
+        pipelineIndex = 1;
+        break;
+    case RenderSampleCount::COUNT_4:
+        pipelineIndex = 2;
+        break;
+    case RenderSampleCount::COUNT_8:
+        pipelineIndex = 3;
+        break;
+    default:
+        return;
+    }
+
+    // The D3D12 shader declares 4095 registers of two vertices.
+    constexpr size_t MaxVertices = 4095 * 2;
+
+    auto& commandList = g_commandLists[g_frame];
+    bool bound = false;
+
+    for (uint32_t layer = 0; layer < depthStencil->layerCount; layer++)
+    {
+        uint32_t eye = g_vrSinglePass ? layer : uint32_t(g_vrPass);
+        const std::vector<float>& mesh = g_vrHiddenAreaMeshes[eye];
+        size_t vertexCount = mesh.size() / 2;
+
+        if (eye >= 2 || vertexCount < 3 || vertexCount > MaxVertices)
+            continue;
+
+        if (!bound)
+        {
+            auto& pipeline = g_vrMaskPipelines[pipelineIndex];
+            if (pipeline == nullptr)
+            {
+                if (g_vrMaskShader == nullptr)
+                    g_vrMaskShader = CREATE_SHADER(xr_mask_vs);
+
+                RenderGraphicsPipelineDesc desc;
+                desc.pipelineLayout = g_pipelineLayout.get();
+                desc.vertexShader = g_vrMaskShader.get();
+                desc.depthFunction = RenderComparisonFunction::ALWAYS;
+                desc.depthEnabled = true;
+                desc.depthWriteEnabled = true;
+                desc.depthTargetFormat = RenderFormat::D32_FLOAT;
+                desc.multisampling.sampleCount = depthStencil->sampleCount;
+                desc.viewportCount = GetVRViewportCount();
+                pipeline = g_device->createGraphicsPipeline(desc);
+            }
+
+            SetFramebuffer(nullptr, depthStencil, true);
+            commandList->setPipeline(pipeline.get());
+            SetHostViewport(commandList.get(), RenderViewport(0.0f, 0.0f, float(depthStencil->width), float(depthStencil->height), 0.0f, 1.0f));
+            SetHostScissor(commandList.get(), RenderRect(0, 0, depthStencil->width, depthStencil->height));
+            bound = true;
+        }
+
+        // The depth and layer, then the vertices in normalised device coordinates.
+        const float* terms = g_vrEyes[eye].projectionTerms;
+        auto allocation = g_uploadAllocators[g_frame].allocate(uint32_t(16 + vertexCount * 8), 0x100);
+        auto header = reinterpret_cast<uint32_t*>(allocation.memory);
+        auto vertices = reinterpret_cast<float*>(allocation.memory + 16);
+
+        float depth = clearZ >= 0.5f ? 0.0f : 1.0f;
+        memcpy(&header[0], &depth, sizeof(depth));
+        header[1] = layer;
+        header[2] = 0;
+        header[3] = 0;
+
+        // Computed apart from the upload: upload memory is not read back.
+        float area = 0.0f;
+
+        for (size_t i = 0; i + 2 < vertexCount; i += 3)
+        {
+            float x[3], y[3];
+            for (size_t j = 0; j < 3; j++)
+            {
+                x[j] = mesh[(i + j) * 2 + 0] * terms[0] - terms[2];
+                y[j] = mesh[(i + j) * 2 + 1] * terms[1] - terms[3];
+                vertices[(i + j) * 2 + 0] = x[j];
+                vertices[(i + j) * 2 + 1] = y[j];
+            }
+
+            // Clipped to the image only roughly: the mesh hugs its edges.
+            area += 0.5f * std::abs((x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]));
+        }
+
+        SetRootDescriptor(allocation, 2);
+        commandList->drawInstanced(uint32_t(vertexCount / 3 * 3), 1, 0, 0);
+
+        if (g_vrPass == 0)
+        {
+            ++g_vrStatistics.hiddenAreaDraws;
+            g_vrStatistics.hiddenAreaTriangles = uint32_t(vertexCount / 3);
+            g_vrStatistics.hiddenAreaShare = area / 4.0f;
+        }
+    }
+
+    if (bound)
+    {
+        g_dirtyStates.renderTargetAndDepthStencil = true;
+        g_dirtyStates.viewport = true;
+        g_dirtyStates.scissorRect = true;
+        g_dirtyStates.pipelineState = true;
+        g_dirtyStates.sharedConstants = true;
+
+        if (g_capabilities.dynamicDepthBias)
+            g_dirtyStates.depthBias = true;
+    }
+}
+
 static void ProcClear(const RenderCommand& cmd)
 {
     const auto& args = cmd.clear;
@@ -6591,6 +6884,7 @@ static void ProcClear(const RenderCommand& cmd)
             SetFramebuffer(nullptr, g_depthStencil, true);
 
         commandList->clearDepth(true, args.z);
+        DrawVRHiddenAreaMask(args.z);
     }
 }
 
@@ -7406,6 +7700,18 @@ static void NoteVRSurfaceDraw(GuestSurface* renderTarget, GuestSurface* depthSte
     }
 }
 
+// VR: starts a GPU segment (see GpuSegmentKind) when the kind of work changes.
+static void BeginGpuSegment(GpuSegmentKind kind)
+{
+    uint32_t& count = g_gpuSegmentCounts[g_frame];
+    if (int32_t(kind) == g_gpuSegmentKind || count == GPU_SEGMENTS_UNUSED || count >= NUM_SEGMENT_QUERIES)
+        return;
+
+    g_commandLists[g_frame]->writeTimestamp(g_segmentQueryPools[g_frame].get(), count);
+    g_gpuSegmentKinds[g_frame][count++] = kind;
+    g_gpuSegmentKind = kind;
+}
+
 // VR single-pass stereo: how a draw into these targets reaches the eyes. In a
 // headset frame, targets with a layer per eye are drawn for both.
 static VRStereoDraw GetVRStereoDraw(GuestSurface* renderTarget, GuestSurface* depthStencil)
@@ -7540,6 +7846,16 @@ static void FlushRenderStateForRenderThread()
     auto depthStencil = g_pipelineState.zEnable ? g_depthStencil : nullptr;
 
     g_vrStereoDraw = GetVRStereoDraw(renderTarget, depthStencil);
+
+    if (g_vrPass >= 0)
+    {
+        const GuestSurface* target = renderTarget != nullptr ? renderTarget : depthStencil;
+
+        if (target != nullptr && target->width == target->height)
+            BeginGpuSegment(GPU_SEGMENT_SHADOWS);
+        else
+            BeginGpuSegment(depthStencil != nullptr ? GPU_SEGMENT_SCENE : GPU_SEGMENT_FLAT);
+    }
 
     bool foundAny = PopulateBarriersForStretchRect(renderTarget, depthStencil);
 

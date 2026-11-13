@@ -111,6 +111,13 @@ struct VR
     // The views located for the frame begun last. Any thread.
     static void GetViews(VRViews& views);
 
+    // The part of an eye's image the lens hides, when the runtime tells
+    // (XR_KHR_visibility_mask): a triangle list of x, y pairs on the plane one
+    // unit in front of the eye (the tangents of the view angles). `serial` is
+    // the caller's copy of the mesh's version; the mesh is only copied, and true
+    // returned, when it differs. Any thread.
+    static bool GetHiddenAreaMesh(uint32_t eye, std::vector<float>& vertices, uint32_t& serial);
+
     // Recentres on the head: the game camera and the screen move in front of it.
     // The runtime's own recenter (a reference space change) and holding both
     // thumbsticks in do the same.
@@ -158,6 +165,7 @@ struct VR
     static void AcquireImages(VRImages&) {}
     static bool EndFrame(const VRFrameResult&) { return false; }
     static void GetViews(VRViews& views) { views = {}; }
+    static bool GetHiddenAreaMesh(uint32_t, std::vector<float>&, uint32_t&) { return false; }
     static void Recenter() {}
     static void UpdateRecenterButtons(bool) {}
     static void SetRenderScale(float) {}

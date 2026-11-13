@@ -93,6 +93,7 @@ CONFIG_DEFINE("VR", bool, VRReuseShadows, true);
 CONFIG_DEFINE("VR", bool, VRSinglePass, false);
 CONFIG_DEFINE("VR", bool, VRPartialConstantUploads, true);
 CONFIG_DEFINE("VR", bool, VRPacingThread, true);
+CONFIG_DEFINE("VR", bool, VRHiddenAreaMask, true);
 
 CONFIG_DEFINE_HIDDEN("Codes", bool, AllowCancellingUnleash, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, DisableAutoSaveWarning, false);

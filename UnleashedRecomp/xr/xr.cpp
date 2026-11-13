@@ -128,6 +128,15 @@ static float g_baseYaw;
 static std::mutex g_viewsMutex;
 static VRViews g_views;
 
+// The hidden area meshes (see VR::GetHiddenAreaMesh), guarded by g_viewsMutex,
+// and their version. They are asked for once the session runs, a few times
+// over in case the runtime has none yet.
+static std::vector<float> g_hiddenAreaMeshes[2];
+static std::atomic<uint32_t> g_hiddenAreaSerial;
+static bool g_hiddenAreaFetched;
+static uint32_t g_hiddenAreaAttempts;
+static uint32_t g_hiddenAreaCountdown;
+
 // The flat screen is placed once in the application space, in front of the
 // head with the head's heading, and stays there while the player looks around.
 static bool g_screenPlaced;
@@ -376,6 +385,101 @@ static void PublishViews()
     g_views = views;
 }
 
+// Asks the runtime for the hidden area meshes. g_mutex is held.
+static void FetchHiddenAreaMeshes()
+{
+    constexpr uint32_t MaxAttempts = 10;
+    constexpr uint32_t FramesBetweenAttempts = 120;
+
+    if (g_hiddenAreaFetched || g_hiddenAreaAttempts >= MaxAttempts)
+        return;
+
+    if (g_hiddenAreaCountdown != 0)
+    {
+        --g_hiddenAreaCountdown;
+        return;
+    }
+
+    ++g_hiddenAreaAttempts;
+    g_hiddenAreaCountdown = FramesBetweenAttempts;
+
+    if (g_hiddenAreaAttempts == MaxAttempts)
+        LOGN("[VR] The runtime has given no hidden area mesh so far; asking one last time.");
+
+    const auto& extensions = g_runtime->EnabledExtensions();
+    if (std::find(extensions.begin(), extensions.end(), "XR_KHR_visibility_mask") == extensions.end())
+    {
+        LOGN("[VR] The runtime has no hidden area mesh (XR_KHR_visibility_mask is not available).");
+        g_hiddenAreaAttempts = MaxAttempts;
+        return;
+    }
+
+    PFN_xrGetVisibilityMaskKHR getVisibilityMask = nullptr;
+    if (XR_FAILED(xrGetInstanceProcAddr(g_runtime->Instance(), "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&getVisibilityMask))) ||
+        getVisibilityMask == nullptr)
+    {
+        g_hiddenAreaAttempts = MaxAttempts;
+        return;
+    }
+
+    std::vector<float> meshes[2];
+
+    for (uint32_t eye = 0; eye < 2; eye++)
+    {
+        XrVisibilityMaskKHR mask{ XR_TYPE_VISIBILITY_MASK_KHR };
+        XrResult result = getVisibilityMask(g_runtime->Session(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+            XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+
+        if (XR_FAILED(result) || mask.vertexCountOutput == 0 || mask.indexCountOutput < 3)
+            return;
+
+        std::vector<XrVector2f> vertices(mask.vertexCountOutput);
+        std::vector<uint32_t> indices(mask.indexCountOutput);
+        mask.vertexCapacityInput = uint32_t(vertices.size());
+        mask.vertices = vertices.data();
+        mask.indexCapacityInput = uint32_t(indices.size());
+        mask.indices = indices.data();
+
+        result = getVisibilityMask(g_runtime->Session(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+            XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+
+        if (XR_FAILED(result))
+            return;
+
+        uint32_t indexCount = std::min(mask.indexCountOutput, uint32_t(indices.size())) / 3 * 3;
+        meshes[eye].reserve(size_t(indexCount) * 2);
+
+        for (uint32_t i = 0; i < indexCount; i++)
+        {
+            if (indices[i] >= vertices.size())
+                return;
+
+            meshes[eye].push_back(vertices[indices[i]].x);
+            meshes[eye].push_back(vertices[indices[i]].y);
+        }
+    }
+
+    LOGFN("[VR] Hidden area mesh: {} triangles for the left eye, {} for the right eye.", meshes[0].size() / 6, meshes[1].size() / 6);
+
+    std::lock_guard lock(g_viewsMutex);
+    g_hiddenAreaMeshes[0] = std::move(meshes[0]);
+    g_hiddenAreaMeshes[1] = std::move(meshes[1]);
+    g_hiddenAreaFetched = true;
+    ++g_hiddenAreaSerial;
+}
+
+bool VR::GetHiddenAreaMesh(uint32_t eye, std::vector<float>& vertices, uint32_t& serial)
+{
+    uint32_t current = g_hiddenAreaSerial;
+    if (eye >= 2 || current == serial)
+        return false;
+
+    std::lock_guard lock(g_viewsMutex);
+    vertices = g_hiddenAreaMeshes[eye];
+    serial = current;
+    return true;
+}
+
 // The per-eye render resolution for a scale of the runtime's recommendation.
 static void GetRenderSize(float scale, uint32_t& width, uint32_t& height)
 {
@@ -396,7 +500,7 @@ bool VR::Init(bool vulkan)
     config.engine_name = "UnleashedRecomp";
     config.reference_space = XR_REFERENCE_SPACE_TYPE_LOCAL;
     config.required_extensions = { vulkan ? XrVulkan::EXTENSION_NAME : XrD3D12::EXTENSION_NAME };
-    config.optional_extensions = { "XR_KHR_win32_convert_performance_counter_time" };
+    config.optional_extensions = { "XR_KHR_win32_convert_performance_counter_time", "XR_KHR_visibility_mask" };
     config.resolution_scale = std::clamp(Config::VRRenderScale.Value, 0.25f, 2.0f);
 
     g_runtime = std::make_unique<PortVr::OpenXRRuntime>(LogOpenXR);
@@ -642,6 +746,9 @@ void VR::BeginFrame()
         PlaceScreen();
 
     PublishViews();
+
+    if (g_frame.should_render)
+        FetchHiddenAreaMeshes();
 
     // Input only belongs to the game while the headset has focus (not in the dashboard).
     g_inputFocused = g_runtime->IsSessionFocused();

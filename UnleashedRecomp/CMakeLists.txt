@@ -521,6 +521,7 @@ compile_pixel_shader(xr_blit_ps)
 compile_pixel_shader(xr_output_ps)
 compile_pixel_shader(xr_ui_ps)
 compile_vertex_shader(xr_ui_vs)
+compile_vertex_shader(xr_mask_vs)
 
 set(RESOURCES_SOURCE_PATH "${PROJECT_SOURCE_DIR}/../UnleashedRecompResources")
 set(RESOURCES_OUTPUT_PATH "${PROJECT_SOURCE_DIR}/res")
