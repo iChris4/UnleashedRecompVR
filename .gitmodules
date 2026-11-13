@@ -6,7 +6,7 @@
 	url = https://github.com/redorav/ddspp.git
 [submodule "tools/XenosRecomp"]
 	path = tools/XenosRecomp
-	url = https://github.com/hedge-dev/XenosRecomp.git
+	url = https://github.com/iChris4/XenosRecomp.git
 [submodule "UnleashedRecompResources"]
 	path = UnleashedRecompResources
 	url = https://github.com/hedge-dev/UnleashedRecompResources.git
@@ -57,4 +57,4 @@
 	url = https://github.com/KhronosGroup/SPIRV-Cross.git
 [submodule "thirdparty/plume"]
 	path = thirdparty/plume
-	url = https://github.com/renderbag/plume.git
+	url = https://github.com/iChris4/plume.git
