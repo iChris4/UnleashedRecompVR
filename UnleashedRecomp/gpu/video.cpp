@@ -434,6 +434,13 @@ static double g_gpuSegmentMs[GPU_SEGMENT_KIND_COUNT];
 static uint32_t g_gpuSegmentFrames;
 static uint64_t g_gpuSegmentTotal;
 
+// [VR] VRPerformanceTest: 1 turns the hidden area mask, 2 foveated rendering, on
+// and off every other second; the frames' GPU segments are then added up apart
+// (state 1 on, 0 off, -1 no test) for the VR log to compare.
+static int8_t g_gpuSegmentTestStates[NUM_FRAMES] = { -1, -1 };
+static double g_gpuSegmentTestMs[2][GPU_SEGMENT_KIND_COUNT];
+static uint32_t g_gpuSegmentTestFrames[2];
+
 static void BeginGpuSegment(GpuSegmentKind kind);
 static bool g_commandListStates[NUM_FRAMES];
 
@@ -1269,6 +1276,18 @@ static uint32_t GetVRViewportCount()
     return g_vrSinglePass ? 2 : 1;
 }
 
+// The shading rate image bound to the frame's command list (see VRFoveation).
+static const RenderTexture* g_boundShadingRateImage;
+
+static void SetShadingRateImage(const RenderTexture* image)
+{
+    if (image != g_boundShadingRateImage)
+    {
+        g_commandLists[g_frame]->setShadingRateImage(image);
+        g_boundShadingRateImage = image;
+    }
+}
+
 // Sets the viewport of a pass the host draws, for every eye.
 static void SetHostViewport(RenderCommandList* commandList, const RenderViewport& viewport)
 {
@@ -1506,6 +1525,9 @@ struct VRDrawStatistics
     // and of that its time flushing state and issuing draws. The GPU's time on
     // the frame's command list (the last one measured), and pipelines the render
     // thread had to create itself.
+    // Draws shaded with a foveation image.
+    uint32_t foveatedDraws;
+
     // Hidden area mask draws, the triangles of the last one and the share of
     // the image they cover.
     uint32_t hiddenAreaDraws;
@@ -1545,7 +1567,32 @@ static uint32_t g_vrHiddenAreaSerials[2];
 static bool g_vrHiddenAreaFrame;
 static bool g_vrLastFrameImmersive;
 static std::unique_ptr<RenderShader> g_vrMaskShader;
-static std::unique_ptr<RenderPipeline> g_vrMaskPipelines[4];
+static std::unique_ptr<RenderPipeline> g_vrMaskPipelines[4][2];
+
+// Fixed foveated rendering ([VR] VRFoveation: 0 off, 1 low, 2 medium, 3 high):
+// draws into the scene's targets are shaded at 2x2 or 4x4 pixels per pixel
+// shader invocation away from the eyes' lens centres, from shading rate images
+// of a texel per screen tile. There is one per eye, for frame replay, which
+// draws one eye at a time, and one for both, for single-pass stereo (one image
+// serves both layers): the finer rate of the two eyes per tile. The HUD, menus,
+// copies and the headset output keep the full rate, and so do frames shown on
+// the floating screen. Needs variable rate shading tier 2 (D3D12 for now).
+struct VRFoveation
+{
+    std::unique_ptr<RenderTexture> images[3];
+    uint32_t sceneWidth = 0;
+    uint32_t sceneHeight = 0;
+    int32_t level = 0;
+    float terms[2][4]{};
+
+    // The tiles at each rate (1x1, 2x2, 4x4), in the image both eyes share.
+    uint32_t tileCounts[3]{};
+};
+
+static VRFoveation g_vrFoveation;
+static std::vector<std::unique_ptr<RenderTexture>> g_vrRetiredFoveationImages[NUM_FRAMES];
+static bool g_vrFoveationFrame;
+static bool g_vrEyesValid;
 
 // The render thread's time processing commands since the frame's output, and
 // the start of the batch of commands it is processing (see g_renderThread).
@@ -1739,6 +1786,8 @@ static XrMatrix LoadGuestMatrix(const uint32_t* constants, size_t firstRegister)
     return matrix;
 }
 
+static void UpdateVRFoveation();
+
 // Called at the end of BeginCommandList while VR is active.
 static void BeginVRFrame()
 {
@@ -1773,7 +1822,17 @@ static void BeginVRFrame()
         ++g_vrStatistics.cutsceneFrames;
     }
 
-    g_vrHiddenAreaFrame = Config::VRHiddenAreaMask && g_vrLastFrameImmersive && !vrCutscene;
+    // [VR] VRPerformanceTest: the feature tested is on every other second.
+    int32_t performanceTest = Config::VRPerformanceTest;
+    bool testOn = (std::chrono::steady_clock::now().time_since_epoch() / std::chrono::seconds(1)) % 2 == 0;
+    bool testing = (performanceTest == 1 || performanceTest == 2) && g_vrLastFrameImmersive && !vrCutscene;
+    g_gpuSegmentTestStates[g_frame] = testing ? int8_t(testOn ? 1 : 0) : int8_t(-1);
+
+    g_vrHiddenAreaFrame = Config::VRHiddenAreaMask && g_vrLastFrameImmersive && !vrCutscene && (performanceTest != 1 || testOn);
+
+    UpdateVRFoveation();
+    g_vrFoveationFrame = g_vrFoveation.images[2] != nullptr && Config::VRFoveation > 0 && g_vrLastFrameImmersive && !vrCutscene &&
+        (performanceTest != 2 || testOn);
 
     if (g_vrHiddenAreaFrame)
     {
@@ -1987,6 +2046,8 @@ static void LatchVRViews()
 
         eyeState.hudMatrix = XrMatrixMultiply(XrMatrixMultiply(panel, eyeFromLevelled), projection);
     }
+
+    g_vrEyesValid = true;
 
     // Single-pass stereo: the panel's matrices are the frame's, one per eye.
     if (g_vrSinglePass)
@@ -2811,6 +2872,16 @@ static void LogVRStatistics()
             s.gpuFrameMs / n, s.gpuFrameMaxMs, s.renderThreadPipelines, s.renderThreadPipelineMs);
     }
 
+    if (s.foveatedDraws != 0)
+    {
+        const VRFoveation& f = g_vrFoveation;
+        uint32_t tiles = std::max(1u, f.tileCounts[0] + f.tileCounts[1] + f.tileCounts[2]);
+
+        LOGFN("[VR] Last 5 s, foveated rendering (level {}): {} draws; the image both eyes share is {:.0f}% at full rate, "
+            "{:.0f}% at 2x2 and {:.0f}% at 4x4 pixels per shading.",
+            f.level, s.foveatedDraws, 100.0 * f.tileCounts[0] / tiles, 100.0 * f.tileCounts[1] / tiles, 100.0 * f.tileCounts[2] / tiles);
+    }
+
     if (s.hiddenAreaDraws != 0)
     {
         LOGFN("[VR] Last 5 s, hidden area mask: {} draws of {} triangles covering {:.1f}% of the image.",
@@ -2821,14 +2892,37 @@ static void LogVRStatistics()
         double segmentMs[GPU_SEGMENT_KIND_COUNT];
         uint32_t segmentFrames;
         uint64_t segmentTotal;
+        double testMs[2][GPU_SEGMENT_KIND_COUNT];
+        uint32_t testFrames[2];
         {
             std::lock_guard lock(g_gpuSegmentMutex);
             memcpy(segmentMs, g_gpuSegmentMs, sizeof(segmentMs));
             segmentFrames = g_gpuSegmentFrames;
             segmentTotal = g_gpuSegmentTotal;
+            memcpy(testMs, g_gpuSegmentTestMs, sizeof(testMs));
+            memcpy(testFrames, g_gpuSegmentTestFrames, sizeof(testFrames));
             memset(g_gpuSegmentMs, 0, sizeof(g_gpuSegmentMs));
             g_gpuSegmentFrames = 0;
             g_gpuSegmentTotal = 0;
+            memset(g_gpuSegmentTestMs, 0, sizeof(g_gpuSegmentTestMs));
+            memset(g_gpuSegmentTestFrames, 0, sizeof(g_gpuSegmentTestFrames));
+        }
+
+        if (testFrames[0] != 0 && testFrames[1] != 0)
+        {
+            auto describe = [&](uint32_t state)
+                {
+                    double n = double(testFrames[state]);
+                    double total = 0.0;
+                    for (double ms : testMs[state])
+                        total += ms;
+
+                    return fmt::format("world {:.2f} ms, post-processing and 2D {:.2f} ms, total {:.2f} ms ({} frames)",
+                        testMs[state][GPU_SEGMENT_SCENE] / n, testMs[state][GPU_SEGMENT_FLAT] / n, total / n, testFrames[state]);
+                };
+
+            LOGFN("[VR] Last 5 s, performance test of {}: on: {}; off: {}.",
+                Config::VRPerformanceTest == 1 ? "the hidden area mask" : "foveated rendering", describe(1), describe(0));
         }
 
         if (segmentFrames != 0)
@@ -4021,8 +4115,9 @@ static void BeginCommandList()
     commandList->resetQueryPool(g_queryPools[g_frame].get(), 0, NUM_QUERIES);
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 0);
 
-    // VR: the frame's GPU segments (see GpuSegmentKind).
+    // VR: the frame's GPU segments (see GpuSegmentKind), and no shading rate image.
     g_gpuSegmentKind = -1;
+    g_boundShadingRateImage = nullptr;
 
     if (VR::IsActive())
     {
@@ -4306,6 +4401,10 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
         g_vrSinglePass = Config::VRSinglePass && g_capabilities.vertexShaderLayerAndViewport;
         g_vrPartialConstantUploads = Config::VRPartialConstantUploads;
+
+        LOGFN("[VR] Variable rate shading from an image: {} (tiles of {} pixels, 4x4 {}).",
+            g_capabilities.shadingRateImage ? "supported" : "not supported", g_capabilities.shadingRateImageTileSize,
+            g_capabilities.shadingRateImageCoarseRates ? "available" : "unavailable");
 
         if (g_vrSinglePass)
         {
@@ -5192,6 +5291,8 @@ static bool IsImGuiFullDisplayTriangle(const ImDrawList* drawList, const ImDrawC
 
 static void ProcDrawImGui(const RenderCommand& cmd)
 {
+    SetShadingRateImage(nullptr);
+
     // VR: in stereo frames the UI goes on the HUD panel. It is drawn once, in the
     // left eye's pass, into the UI texture that both eyes composite; what covers
     // the whole display (fades, dimmed backgrounds) is drawn into each eye.
@@ -5527,6 +5628,15 @@ void Video::Present()
 
                 ++g_gpuSegmentFrames;
                 g_gpuSegmentTotal += segmentCount;
+
+                int8_t testState = g_gpuSegmentTestStates[g_frame];
+                if (testState >= 0)
+                {
+                    for (size_t i = 0; i < GPU_SEGMENT_KIND_COUNT; i++)
+                        g_gpuSegmentTestMs[testState][i] += segmentMs[i];
+
+                    ++g_gpuSegmentTestFrames[testState];
+                }
             }
         }
     }
@@ -5802,6 +5912,7 @@ static void ProcessRenderCommand(const RenderCommand& cmd);
 // layer of the back buffer. Any other frame goes to the floating screen.
 static void ExecuteVROutput()
 {
+    SetShadingRateImage(nullptr);
     g_vrRecording = false;
     BeginGpuSegment(GPU_SEGMENT_OUTPUT);
 
@@ -6564,7 +6675,8 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                         g_framebuffer = texture->framebuffer.get();
                     }
 
-                    // An instance per layer of the texture (single-pass stereo).
+                    // An instance per layer of the texture (single-pass stereo), at the full rate.
+                    SetShadingRateImage(nullptr);
                     commandList->setPipeline(pipeline);
                     SetHostViewport(commandList.get(), RenderViewport(0.0f, 0.0f, float(texture->width), float(texture->height), 0.0f, 1.0f));
                     SetHostScissor(commandList.get(), RenderRect(0, 0, texture->width, texture->height));
@@ -6710,6 +6822,114 @@ static void Clear(GuestDevice* device, uint32_t flags, uint32_t, be<float>* colo
     g_renderQueue.enqueue(cmd);
 }
 
+// Builds the foveation images (see VRFoveation) for the scene's size and the
+// eyes' lenses, when they changed. Called at the start of a frame's command list.
+static void UpdateVRFoveation()
+{
+    VRFoveation& f = g_vrFoveation;
+    g_vrRetiredFoveationImages[g_frame].clear();
+
+    int32_t level = std::clamp(Config::VRFoveation.Value, 0, 3);
+    if (level == 0 || !g_capabilities.shadingRateImage || g_capabilities.shadingRateImageTileSize == 0 || !g_vrEyesValid)
+        return;
+
+    int32_t sceneWidth, sceneHeight;
+    GetVRSceneSize(sceneWidth, sceneHeight);
+    if (sceneWidth <= 0 || sceneHeight <= 0)
+        return;
+
+    bool rebuild = f.images[0] == nullptr || f.level != level || f.sceneWidth != uint32_t(sceneWidth) || f.sceneHeight != uint32_t(sceneHeight);
+    for (uint32_t eye = 0; eye < 2 && !rebuild; eye++)
+    {
+        for (uint32_t i = 0; i < 4; i++)
+            rebuild |= std::abs(f.terms[eye][i] - g_vrEyes[eye].projectionTerms[i]) > 1.0e-3f;
+    }
+
+    if (!rebuild)
+        return;
+
+    for (auto& image : f.images)
+    {
+        if (image != nullptr)
+            g_vrRetiredFoveationImages[g_frame].push_back(std::move(image));
+    }
+
+    f.level = level;
+    f.sceneWidth = uint32_t(sceneWidth);
+    f.sceneHeight = uint32_t(sceneHeight);
+    for (uint32_t eye = 0; eye < 2; eye++)
+        memcpy(f.terms[eye], g_vrEyes[eye].projectionTerms, sizeof(f.terms[eye]));
+
+    // The angle off each lens's axis (degrees) up to which tiles keep the full
+    // rate, and up to which they are shaded at 2x2; beyond, 4x4 where available.
+    static constexpr float FullRateAngles[] = { 0.0f, 35.0f, 27.0f, 20.0f };
+    static constexpr float HalfRateAngles[] = { 0.0f, 90.0f, 40.0f, 32.0f };
+
+    // D3D12_SHADING_RATE values.
+    constexpr uint8_t Rate1x1 = 0x0;
+    constexpr uint8_t Rate2x2 = 0x5;
+    constexpr uint8_t Rate4x4 = 0xA;
+    const uint8_t rates[3] = { Rate1x1, Rate2x2, g_capabilities.shadingRateImageCoarseRates ? Rate4x4 : Rate2x2 };
+
+    uint32_t tileSize = g_capabilities.shadingRateImageTileSize;
+    uint32_t tilesX = (f.sceneWidth + tileSize - 1) / tileSize;
+    uint32_t tilesY = (f.sceneHeight + tileSize - 1) / tileSize;
+    uint32_t pitch = (tilesX + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+
+    float fullRateTangent = tanf(FullRateAngles[level] * 3.14159265f / 180.0f);
+    float halfRateTangent = tanf(std::min(HalfRateAngles[level], 89.0f) * 3.14159265f / 180.0f);
+
+    auto& commandList = g_commandLists[g_frame];
+    memset(f.tileCounts, 0, sizeof(f.tileCounts));
+
+    for (uint32_t image = 0; image < 3; image++)
+    {
+        auto allocation = g_uploadAllocators[g_frame].allocate(pitch * tilesY, PLACEMENT_ALIGNMENT);
+
+        for (uint32_t y = 0; y < tilesY; y++)
+        {
+            for (uint32_t x = 0; x < tilesX; x++)
+            {
+                // The tile's centre in normalised device coordinates.
+                float ndcX = (std::min(float(x * tileSize) + 0.5f * tileSize, float(f.sceneWidth)) / float(f.sceneWidth)) * 2.0f - 1.0f;
+                float ndcY = 1.0f - (std::min(float(y * tileSize) + 0.5f * tileSize, float(f.sceneHeight)) / float(f.sceneHeight)) * 2.0f;
+
+                // The finer rate of the eyes the image is for.
+                uint32_t rateIndex = 2;
+                for (uint32_t eye = 0; eye < 2; eye++)
+                {
+                    if (image < 2 && eye != image)
+                        continue;
+
+                    const float* terms = f.terms[eye];
+                    float tangentX = (ndcX + terms[2]) / terms[0];
+                    float tangentY = (ndcY + terms[3]) / terms[1];
+                    float tangent = sqrtf(tangentX * tangentX + tangentY * tangentY);
+
+                    uint32_t eyeRateIndex = tangent <= fullRateTangent ? 0 : (tangent <= halfRateTangent ? 1 : 2);
+                    rateIndex = std::min(rateIndex, eyeRateIndex);
+                }
+
+                allocation.memory[y * pitch + x] = rates[rateIndex];
+
+                if (image == 2)
+                    ++f.tileCounts[rates[rateIndex] == Rate1x1 ? 0 : (rates[rateIndex] == Rate2x2 ? 1 : 2)];
+            }
+        }
+
+        f.images[image] = g_device->createTexture(RenderTextureDesc::Texture2D(tilesX, tilesY, 1, RenderFormat::R8_UINT, RenderTextureFlag::NONE));
+
+        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(f.images[image].get(), RenderTextureLayout::COPY_DEST));
+        commandList->copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(f.images[image].get(), 0),
+            RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, RenderFormat::R8_UINT, tilesX, tilesY, 1, pitch, allocation.offset));
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(f.images[image].get(), RenderTextureLayout::SHADING_RATE_SOURCE));
+    }
+
+    LOGFN("[VR] Foveated rendering (level {}): {}x{} tiles of {} pixels; the image both eyes share is {:.0f}% at full rate.",
+        level, tilesX, tilesY, tileSize, 100.0 * f.tileCounts[0] / std::max(1u, tilesX * tilesY));
+}
+
 // VR: draws the hidden area mask (see g_vrHiddenAreaFrame) into the depth buffer
 // just cleared to `clearZ`, at the opposite end of the depth range, for the eye
 // being drawn or in single-pass stereo for each eye's layer.
@@ -6763,7 +6983,11 @@ static void DrawVRHiddenAreaMask(float clearZ)
 
         if (!bound)
         {
-            auto& pipeline = g_vrMaskPipelines[pipelineIndex];
+            // Compared the way the game's draws compare (a reversed depth range
+            // is cleared to 0): a write against that direction may turn the
+            // GPU's coarse depth culling off until the next clear.
+            bool reversed = clearZ < 0.5f;
+            auto& pipeline = g_vrMaskPipelines[pipelineIndex][reversed ? 1 : 0];
             if (pipeline == nullptr)
             {
                 if (g_vrMaskShader == nullptr)
@@ -6772,7 +6996,7 @@ static void DrawVRHiddenAreaMask(float clearZ)
                 RenderGraphicsPipelineDesc desc;
                 desc.pipelineLayout = g_pipelineLayout.get();
                 desc.vertexShader = g_vrMaskShader.get();
-                desc.depthFunction = RenderComparisonFunction::ALWAYS;
+                desc.depthFunction = reversed ? RenderComparisonFunction::GREATER_EQUAL : RenderComparisonFunction::LESS_EQUAL;
                 desc.depthEnabled = true;
                 desc.depthWriteEnabled = true;
                 desc.depthTargetFormat = RenderFormat::D32_FLOAT;
@@ -7887,6 +8111,24 @@ static void FlushRenderStateForRenderThread()
 
     SetFramebuffer(renderTarget, depthStencil, false);
     FlushViewport();
+
+    // VR: foveated rendering for draws into the scene's targets (see VRFoveation).
+    const RenderTexture* shadingRateImage = nullptr;
+
+    if (g_vrFoveationFrame && g_vrPass >= 0)
+    {
+        GuestSurface* target = renderTarget != nullptr ? renderTarget : depthStencil;
+
+        if (target != nullptr && target != g_backBuffer &&
+            std::abs(int32_t(target->width) - int32_t(g_vrFoveation.sceneWidth)) <= 2 &&
+            std::abs(int32_t(target->height) - int32_t(g_vrFoveation.sceneHeight)) <= 2)
+        {
+            shadingRateImage = g_vrFoveation.images[g_vrSinglePass ? 2 : g_vrPass].get();
+            ++g_vrStatistics.foveatedDraws;
+        }
+    }
+
+    SetShadingRateImage(shadingRateImage);
 
     auto& commandList = g_commandLists[g_frame];
 
